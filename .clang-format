@@ -1,0 +1,25 @@
+# wing-gcc C formatting rules (clang-format / VSCode C_Cpp).
+#
+# Matches the style already used in src/ and include/: 4-space indents,
+# functions with the brace on its own line, control statements attached,
+# right-aligned pointers, 100-column soft limit.
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+BreakBeforeBraces: Linux
+PointerAlignment: Right
+DerivePointerAlignment: false
+
+# The codebase keeps comments wrapped by hand; do not reflow them on save.
+ReflowComments: false
+
+Cpp11BracedListStyle: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortBlocksOnASingleLine: Never
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+SortIncludes: true
+IndentCaseLabels: false

@@ -1,0 +1,7 @@
+bin/
+.agents-log/
+test.txt
+AGENTS.md
+TODO.md
+reference/
+.vscode/
