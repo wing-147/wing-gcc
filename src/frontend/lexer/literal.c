@@ -1,12 +1,11 @@
-// Lexing runs in two passes with different contracts: tokenize() only cuts
-// token boundaries (testable without any position information), while
-// tokenize_file() attaches spans and decodes literal values, so every literal
-// diagnostic can be reported against a located token.
+// Literal decoding validates pp-number spellings and transfers decoded scalar
+// or byte-string payloads only after the lexer coordinator has located tokens.
 
-#include "frontend/lexer.h"
+#include "lexer_internal.h"
+
+#include "config.h"
 #include "util/common.h"
 #include "util/diagnostic.h"
-#include "util/hashmap.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -14,9 +13,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-// Literal decoding: token_num()/token_char()/token_string() run after
-// tokenize() and add_token_metadata(), once every token has a located span.
 
 typedef enum {
     NUMBER_OK,
@@ -52,33 +48,10 @@ typedef enum {
     UCN_INVALID,
 } UcnError;
 
-// Keyword lookup table, built on first use and released at process exit.
-static HashMap g_keywords;
-
-// ---------------------------------------------------------------------------
-// Low-level helpers
-// ---------------------------------------------------------------------------
-
-static void keywords_fini(void)
-{
-    hashmap_free(&g_keywords);
-}
-
 // Check whether str starts with the given prefix.
 static inline bool startswith(const char *str, const char *prefix)
 {
     return strncmp(str, prefix, strlen(prefix)) == 0;
-}
-
-// Create a token from the source range [start, end).
-// The token keeps a reference to the original source buffer.
-static Token *new_token(TokenType type, const char *start, const char *end)
-{
-    Token *tok = xcalloc(1, sizeof(Token));
-    tok->type = type;
-    tok->span.start = start;
-    tok->span.length = end - start;
-    return tok;
 }
 
 // Value of a hexadecimal digit. Callers must pass a digit they have already
@@ -88,292 +61,8 @@ static inline int digit_value(char c)
     return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10;
 }
 
-// Return the byte length of the UTF-8 sequence beginning at `p`, so that an
-// unrecognized character is reported and skipped as a whole. The length is
-// clamped to the terminating NUL and to well-formed continuation bytes, so
-// the result never points past the end of the buffer.
-static size_t utf8_len(const char *p)
-{
-    unsigned char c = (unsigned char)p[0];
-    size_t n;
-
-    if (c < 0x80 || (c & 0xc0) == 0x80)
-        n = 1; // ASCII or a stray continuation byte
-    else if ((c & 0xe0) == 0xc0)
-        n = 2;
-    else if ((c & 0xf0) == 0xe0)
-        n = 3;
-    else if ((c & 0xf8) == 0xf0)
-        n = 4;
-    else
-        n = 1;
-
-    for (size_t i = 1; i < n; i++) {
-        if (p[i] == '\0' || ((unsigned char)p[i] & 0xc0) != 0x80)
-            return i; // truncated/invalid: stop at the last complete byte
-    }
-
-    return n;
-}
-
-// Check whether the current position starts a string literal.
-static bool is_string_literal(const char *p)
-{
-    return *p == '"' || startswith(p, "u8\"") || startswith(p, "u\"") || startswith(p, "U\"") ||
-           startswith(p, "L\"");
-}
-
-// Check whether the current position starts a character literal.
-static bool is_char_literal(const char *p)
-{
-    return *p == '\'' || startswith(p, "u'") || startswith(p, "U'") || startswith(p, "L'");
-}
-
-// Check whether a token text is a reserved keyword.
-static bool is_keyword(const char *start, size_t length)
-{
-    if (g_keywords.capacity == 0) {
-        // clang-format off
-        static const char *kw[] = {
-            "return",    "if",         "else",
-            "for",       "while",      "int",
-            "sizeof",    "char",       "struct",
-            "union",     "short",      "long",
-            "void",      "typedef",    "_Bool",
-            "enum",      "static",     "goto",
-            "break",     "continue",   "switch",
-            "case",      "default",    "extern",
-            "_Alignof",  "_Alignas",   "do",
-            "signed",    "unsigned",   "const",
-            "volatile",  "auto",       "register",
-            "restrict",  "__restrict", "__restrict__",
-            "_Noreturn", "float",      "double",
-            "typeof",    "asm",        "_Thread_local",
-            "__thread",  "_Atomic",    "__attribute__",
-            "inline",    "_Static_assert", "_Generic",
-            "_Complex",  "_Imaginary",
-            "__asm__",   "__inline__", "__typeof__",
-            "__volatile__", "__const__", "__signed__",
-            "__alignof__",
-        };
-        // clang-format on
-
-        for (size_t i = 0; i < sizeof(kw) / sizeof(*kw); i++)
-            hashmap_put(&g_keywords, kw[i], (void *)1);
-
-        atexit(keywords_fini);
-    }
-
-    return hashmap_get_range(&g_keywords, start, length) != NULL;
-}
-
 // ---------------------------------------------------------------------------
-// Token scanning
-// ---------------------------------------------------------------------------
-
-// Scan a numeric literal.
-// This function only determines the token boundary; token_num() validates and
-// decodes it later. '_' belongs to a pp-number, which keeps spellings like
-// `1_000` and `2._` in one token so the validator can reject them like GCC.
-static Token *lex_number(const char **current)
-{
-    const char *start = *current;
-    const char *p = start;
-    while (true) {
-        // Consume exponent signs such as e+10 or p-2.
-        if (p[0] && p[1] && strchr("eEpP", (unsigned char)p[0]) &&
-            strchr("+-", (unsigned char)p[1])) {
-            p += 2;
-        }
-        // Consume identifier-nondigits, digits and dots within the token.
-        else if (isalnum((unsigned char)*p) || *p == '_' || *p == '.') {
-            p++;
-        } else {
-            break;
-        }
-    }
-    *current = p;
-    return new_token(TOKEN_NUMBER, start, p);
-}
-
-// Scan a string literal.
-// This function only determines the token boundary; token_string() decodes the
-// contents later.
-static Token *lex_string(const char **current, const char *limit)
-{
-    const char *start = *current;
-    const char *p = start;
-
-    if (startswith(p, "u8\""))
-        p += 3;
-    else if (startswith(p, "u\"") || startswith(p, "U\"") || startswith(p, "L\""))
-        p += 2;
-    else
-        p++;
-
-    while (p < limit && !is_line_break(*p)) {
-        if (*p == '\\') {
-            p++;
-            if (p < limit && !is_line_break(*p)) {
-                p++;
-            }
-        } else if (*p == '"') {
-            p++;
-            *current = p;
-            return new_token(TOKEN_STRING, start, p);
-        } else {
-            p++;
-        }
-    }
-
-    // Recovery: report and stop at the newline (or EOF); the caller continues
-    // lexing the following line. Underline the malformed literal like GCC.
-    error_span(start, p, "missing terminating \" character");
-    *current = p;
-    return NULL;
-}
-
-// Scan a character constant.
-// This function only determines the token boundary; token_char() decodes the
-// value later. An empty constant is reported here so its diagnostic keeps the
-// source position GCC uses.
-static Token *lex_char(const char **current, const char *limit)
-{
-    const char *start = *current;
-    const char *p = start;
-
-    if (startswith(p, "u'") || startswith(p, "U'") || startswith(p, "L'"))
-        p += 2;
-    else
-        p++;
-
-    const char *content = p;
-
-    while (p < limit && !is_line_break(*p)) {
-        if (*p == '\\') {
-            p++;
-            if (p < limit && !is_line_break(*p))
-                p++;
-        } else if (*p == '\'') {
-            if (p == content)
-                error_span(start, p + 1, "empty character constant");
-            p++;
-            *current = p;
-            return new_token(TOKEN_CHAR, start, p);
-        } else {
-            p++;
-        }
-    }
-
-    // Recovery: report and stop at the newline (or EOF). Underline the
-    // malformed literal like GCC.
-    error_span(start, p, "missing terminating ' character");
-    *current = p;
-    return NULL;
-}
-
-// Return the length of the punctuation token at the current position.
-// Matching is driven by the first byte; multi-byte punctuators are checked
-// before their prefixes, so the longest punctuator wins.
-static size_t read_punct(const char *p)
-{
-    switch (*p) {
-    case '[':
-    case ']':
-    case '(':
-    case ')':
-    case '{':
-    case '}':
-    case ';':
-    case ',':
-    case '?':
-    case ':':
-    case '~':
-        return 1;
-    case '.':
-        return p[1] == '.' && p[2] == '.' ? 3 : 1;
-    case '<':
-        if (p[1] == '<')
-            return p[2] == '=' ? 3 : 2;
-        return p[1] == '=' ? 2 : 1;
-    case '>':
-        if (p[1] == '>')
-            return p[2] == '=' ? 3 : 2;
-        return p[1] == '=' ? 2 : 1;
-    case '=':
-    case '!':
-    case '*':
-    case '/':
-    case '%':
-    case '^':
-        return p[1] == '=' ? 2 : 1;
-    case '+':
-        return (p[1] == '+' || p[1] == '=') ? 2 : 1;
-    case '-':
-        if (p[1] == '-')
-            return 2;
-        return (p[1] == '=' || p[1] == '>') ? 2 : 1;
-    case '&':
-        return (p[1] == '&' || p[1] == '=') ? 2 : 1;
-    case '|':
-        return (p[1] == '|' || p[1] == '=') ? 2 : 1;
-    case '#':
-        return p[1] == '#' ? 2 : 1;
-    default:
-        return 0;
-    }
-}
-
-// Scan an identifier or keyword token.
-// The first character must already be validated by the caller.
-// The scanned text is classified after checking the keyword table.
-static Token *lex_identifier(const char **current)
-{
-    const char *start = *current;
-    // '$' is a GCC extension accepted in identifiers by default.
-    while (isalnum((unsigned char)**current) || **current == '_' || **current == '$') {
-        (*current)++;
-    }
-    size_t len = *current - start;
-    if (is_keyword(start, len))
-        return new_token(TOKEN_KEYWORD, start, *current);
-
-    return new_token(TOKEN_IDENT, start, *current);
-}
-
-// Render an unrecognized byte the way GCC does: printable ASCII as itself,
-// anything else as the octal value of the first byte.
-static void report_stray(const char *start)
-{
-    unsigned char c = (unsigned char)*start;
-
-    if (c >= 0x20 && c < 0x7f)
-        error_span(start, start + 1, "stray '%c' in program", (int)c);
-    else
-        error_span(start, start + 1, "stray '\\%o' in program", (unsigned)c);
-}
-
-// Scan a punctuation token and advance the current position.
-// On an unrecognized character, reports it, skips one code point and returns
-// NULL so that lexing can continue.
-static Token *lex_punct(const char **current)
-{
-    const char *start = *current;
-    size_t len = read_punct(start);
-
-    if (len == 0) {
-        size_t n = utf8_len(start);
-        report_stray(start);
-        *current = start + n;
-        return NULL;
-    }
-
-    *current += len;
-    return new_token(TOKEN_PUNCT, start, *current);
-}
-
-// ---------------------------------------------------------------------------
-// Literal decoding
+// Literal validation and decoding
 // ---------------------------------------------------------------------------
 
 // Parse the integer suffix of a constant (C11 6.4.4.1). Case is significant
@@ -409,6 +98,7 @@ static bool parse_int_suffix(const char *s, size_t n, int *long_count, bool *is_
     return true;
 }
 
+// Recognize the complete optional suffix of a floating constant.
 static bool is_valid_float_suffix(const char *s, size_t n)
 {
     return n == 0 || (n == 1 && (s[0] == 'f' || s[0] == 'F' || s[0] == 'l' || s[0] == 'L'));
@@ -427,11 +117,14 @@ static NumberInfo scan_number(const char *start, const char *end)
         (isxdigit((unsigned char)p[2]) || p[2] == '.')) {
         info.base = 16;
         p += 2;
-    } else if (end - start > 2 && p[0] == '0' && (p[1] == 'b' || p[1] == 'B') &&
-               (p[2] == '0' || p[2] == '1')) {
+    }
+#if GNU_EXTENSION
+    else if (end - start > 2 && p[0] == '0' && (p[1] == 'b' || p[1] == 'B') &&
+             (p[2] == '0' || p[2] == '1')) {
         info.base = 2;
         p += 2;
     }
+#endif
 
     if (info.base == 16) {
         int digits = 0;
@@ -468,7 +161,9 @@ static NumberInfo scan_number(const char *start, const char *end)
             return info;
         }
         info.is_float = has_dot || has_exp;
-    } else if (info.base == 2) {
+    }
+#if GNU_EXTENSION
+    else if (info.base == 2) {
         while (p < end && isdigit((unsigned char)*p)) {
             if (*p > '1') {
                 info.error = NUMBER_INVALID_DIGIT_BINARY;
@@ -482,7 +177,9 @@ static NumberInfo scan_number(const char *start, const char *end)
             return info;
         }
         info.is_float = false;
-    } else {
+    }
+#endif
+    else {
         // Decimal or octal mantissa, optionally followed by a decimal exponent.
         while (p < end) {
             if (isdigit((unsigned char)*p)) {
@@ -595,7 +292,8 @@ static uint64_t decode_int(const char *start, size_t body_len, int base)
 // Validate and decode one numeric token; on error report and leave the value 0.
 static void token_num(Token *tok)
 {
-    NumberInfo info = scan_number(tok->span.start, tok->span.start + tok->span.length);
+    NumberInfo info = scan_number(string_view_begin(tok->span.text),
+                                  string_view_end(tok->span.text));
 
     switch (info.error) {
     case NUMBER_OK:
@@ -627,14 +325,15 @@ static void token_num(Token *tok)
         error_at(&tok->span, "no digits in hexadecimal floating constant");
         return;
     case NUMBER_BINARY_FLOAT_PREFIX:
-        error_at(&tok->span, "invalid prefix \"%.2s\" for floating constant", tok->span.start);
+        error_at(&tok->span, "invalid prefix \"%.2s\" for floating constant",
+                 string_view_begin(tok->span.text));
         return;
     }
 
     if (info.is_float) {
         char *endp;
-        tok->fval = strtold(tok->span.start, &endp);
-        if (endp != tok->span.start + info.body_len)
+        tok->value.floating = strtold(string_view_begin(tok->span.text), &endp);
+        if (endp != string_view_begin(tok->span.text) + info.body_len)
             unreachable();
         if (info.suffix_len == 0)
             tok->literal = LITERAL_DOUBLE;
@@ -643,9 +342,10 @@ static void token_num(Token *tok)
         else
             tok->literal = LITERAL_LDOUBLE;
     } else {
-        tok->val = (int64_t)decode_int(tok->span.start, info.body_len, info.base);
+        tok->value.integer =
+            (int64_t)decode_int(string_view_begin(tok->span.text), info.body_len, info.base);
         tok->literal =
-            infer_int_type((uint64_t)tok->val, info.base, info.long_count, info.is_unsigned);
+            infer_int_type((uint64_t)tok->value.integer, info.base, info.long_count, info.is_unsigned);
     }
 }
 
@@ -750,9 +450,16 @@ static int decode_escape(Token *tok, const char **pp, const char *end, unsigned 
     case 'b':
         out[0] = 8;
         break;
+#if GNU_EXTENSION
     case 'e': // GNU extension
         out[0] = 27;
         break;
+#else
+    case 'e':
+        error_at(&tok->span, "non-ISO-standard escape sequence, '\\e'");
+        out[0] = 27;
+        break;
+#endif
     case 'f':
         out[0] = 12;
         break;
@@ -831,11 +538,11 @@ static int decode_escape(Token *tok, const char **pp, const char *end, unsigned 
     return 1;
 }
 
-// Decode the contents of a TOKEN_STRING into a heap buffer.
+// Decode the contents of a TOK_STRING into a heap buffer.
 static void token_string(Token *tok)
 {
-    const char *start = tok->span.start;
-    const char *end = start + tok->span.length;
+    const char *start = string_view_begin(tok->span.text);
+    const char *end = string_view_end(tok->span.text);
     const char *p = start;
 
     if (startswith(p, "u8\""))
@@ -874,7 +581,7 @@ static int64_t truncate_int32(uint32_t value)
     return (value & 0x80000000u) ? (int64_t)value - 0x100000000LL : (int64_t)value;
 }
 
-// Decode a TOKEN_CHAR value the way GCC does:
+// Decode a TOK_CHARACTER value the way GCC does:
 //   - a plain constant with exactly one decoded byte is sign-extended
 //     ('\xff' == -1), otherwise the bytes pack MSB first and truncate to int
 //     ('hello' == 0x656C6C6F);
@@ -882,8 +589,8 @@ static int64_t truncate_int32(uint32_t value)
 //     U/L to 32).
 static void token_char(Token *tok)
 {
-    const char *start = tok->span.start;
-    const char *end = start + tok->span.length;
+    const char *start = string_view_begin(tok->span.text);
+    const char *end = string_view_end(tok->span.text);
     const char *p = start;
     bool wide = false;
 
@@ -926,188 +633,93 @@ static void token_char(Token *tok)
             value &= 0xffffu;
         else
             value &= 0xffffffffu;
-        tok->val = truncate_int32(value);
+        tok->value.integer = truncate_int32(value);
     } else if (count == 1) {
-        tok->val = (value & 0x80u) ? (int64_t)value - 0x100 : (int64_t)value;
+        tok->value.integer = (value & 0x80u) ? (int64_t)value - 0x100 : (int64_t)value;
     } else {
-        tok->val = truncate_int32(value);
+        tok->value.integer = truncate_int32(value);
     }
     tok->literal = LITERAL_INT;
 }
 
 // Decode every literal token in the list; lexical errors keep the list going.
-static void parse_token_values(Token *tok)
+void decode_token_literals(Token *tok)
 {
     for (; tok; tok = tok->next) {
-        if (tok->type == TOKEN_NUMBER)
+        if (tok->kind == TOK_NUMBER)
             token_num(tok);
-        else if (tok->type == TOKEN_CHAR)
+        else if (tok->kind == TOK_CHARACTER)
             token_char(tok);
-        else if (tok->type == TOKEN_STRING)
+        else if (tok->kind == TOK_STRING)
             token_string(tok);
     }
 }
 
-// ---------------------------------------------------------------------------
-// Token pipeline
-// ---------------------------------------------------------------------------
-
-// Attach `file` to every token in the list.
-static void add_token_file(Token *tok, SourceFile *file)
+// Concatenate each maximal run of decoded TOK_STRING payloads as C11
+// translation phase 6 requires. The first token survives with the complete
+// source extent and owns one combined buffer; absorbed tokens are detached and
+// released through the normal lexer lifecycle.
+void concatenate_string_literals(Token *tokens)
 {
-    for (; tok; tok = tok->next)
-        tok->span.file = file;
-}
-
-// Assign 1-based line/column to every token by walking the source once.
-// Columns are display columns (see source.h), matching diagnostics. Tokens must
-// be ordered by span.start, which tokenize() guarantees.
-static void add_line_column(Token *tok, SourceFile *file)
-{
-    const char *p = file->contents;
-    unsigned line = 1;
-    int width = 0; // 0-based display width within the current line
-
-    for (; tok; tok = tok->next) {
-        if (tok->span.start < p)
-            unreachable();
-
-        advance_position(p, tok->span.start, &line, &width);
-        p = tok->span.start;
-
-        tok->span.line = line;
-        tok->span.column = (unsigned)width + 1;
-    }
-}
-
-// Attach all token metadata (file, then line/column) in one call.
-static void add_token_metadata(Token *tok, SourceFile *file)
-{
-    add_token_file(tok, file);
-    add_line_column(tok, file);
-}
-
-// Convert source code into a linked list of tokens.
-// This is the entry point of lexical analysis.
-Token *tokenize(const char *contents, size_t length)
-{
-    const char *content = contents;
-    const char *limit = contents + length;
-
-    Token head = { 0 };
-    Token *curr = &head;
-
-    while (content < limit) {
-        Token *tok = NULL;
-        const char *before = content;
-
-        // GCC ignores NUL bytes embedded in the file; skip them so lexing
-        // continues past them.
-        if (*content == '\0') {
-            content++;
+    for (Token *first = tokens; first; first = first->next) {
+        if (first->kind != TOK_STRING)
             continue;
+
+        size_t length = (size_t)first->str_len;
+        Token *last = first;
+        while (last->next && last->next->kind == TOK_STRING) {
+            last = last->next;
+            length += (size_t)last->str_len;
         }
-        // skip line comments (a lone CR also ends the comment)
-        if (startswith(content, "//")) {
-            content += 2;
-            while (content < limit && !is_line_break(*content))
-                content++;
+        if (last == first)
             continue;
-        }
-        // skip block comments; a NUL inside is data, so match the terminator
-        // byte-wise instead of with strstr()
-        else if (startswith(content, "/*")) {
-            const char *p = content + 2;
-            while (p + 1 < limit && !(p[0] == '*' && p[1] == '/'))
-                p++;
-            if (p + 1 >= limit) {
-                // Recovery: unterminated comment consumes the rest of the file.
-                error_span(content, content + 1, "unterminated comment");
-                content = limit; // EOF token lands at end of file
+
+        char *joined = xmalloc(length + 1);
+        size_t offset = 0;
+        for (Token *part = first;; part = part->next) {
+            memcpy(joined + offset, part->str, (size_t)part->str_len);
+            offset += (size_t)part->str_len;
+            if (part == last)
                 break;
-            }
-            content = p + 2;
-            continue;
         }
-        //  skip possible space
-        else if (isspace((unsigned char)*content)) {
-            content++;
-            continue;
+        joined[length] = '\0';
+
+        SourceSpan span = source_span_join(&first->span, &last->span);
+        Token *after = last->next;
+        Token *absorbed = first->next;
+        free(first->str);
+        first->span = span;
+        first->str = joined;
+        first->str_len = (int)length;
+        first->next = after;
+
+        while (absorbed != after) {
+            Token *next = absorbed->next;
+            absorbed->next = NULL;
+            token_free(absorbed);
+            absorbed = next;
         }
-        //  Numeric literal (a pp-number may also start with '.' + digit)
-        else if (isdigit((unsigned char)*content) ||
-                 (*content == '.' && isdigit((unsigned char)content[1]))) {
-            tok = lex_number(&content);
-        }
-        // String literal
-        else if (is_string_literal(content)) {
-            tok = lex_string(&content, limit);
-        }
-        // Character literal
-        else if (is_char_literal(content)) {
-            tok = lex_char(&content, limit);
-        }
-        // Identifier or keyword ('$' is a GCC extension in identifiers)
-        else if (isalpha((unsigned char)*content) || *content == '_' || *content == '$') {
-            tok = lex_identifier(&content);
-        }
-        // Punctuators
-        else {
-            tok = lex_punct(&content);
-        }
-
-        // Guard the recovery invariant: never re-lex the same position.
-        if (content == before) {
-            unreachable();
-        }
-
-        // A NULL token means a lexical error was already reported and the
-        // pointer was advanced; keep going.
-        if (!tok)
-            continue;
-
-        curr->next = tok;
-        curr = tok;
-    }
-
-    // Add EOF token at the end of token stream
-    Token *eof = new_token(TOKEN_EOF, content, content);
-    curr->next = eof;
-    return head.next;
-}
-
-// Load `path`, lex it, attach metadata and decode literal values.
-// Returns the token list, or NULL on I/O failure with errno preserved. On
-// success the loaded file becomes current_source(); the caller releases the
-// tokens with token_free() and the file with source_free(current_source()).
-Token *tokenize_file(const char *path)
-{
-    SourceFile *file = source_load(path);
-    if (!file)
-        return NULL;
-
-    set_current_source(file); // used by diagnostics inside tokenize()
-
-    Token *tokens = tokenize(file->contents, file->size);
-    add_token_metadata(tokens, file);
-    parse_token_values(tokens);
-    return tokens;
-}
-
-// Release a token list produced by tokenize()/tokenize_file(). Safe with NULL.
-void token_free(Token *tok)
-{
-    while (tok) {
-        Token *next = tok->next;
-        free(tok->str);
-        free(tok);
-        tok = next;
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #ifdef TEST_LEXER
 
 static int failures = 0;
+static SourceFile g_test_source = { .name = (char *)"<lexer-test>" };
+
+// Build a complete token stream for byte-oriented lexer tests. The shared
+// fixture outlives every token inspection in a single test call.
+static Token *tokenize_text(const char *src, size_t length)
+{
+    g_test_source.contents = (char *)src;
+    g_test_source.size = length;
+    return tokenize(&g_test_source);
+}
 
 static void check_loc(Token *tok, uint32_t line, uint32_t column, const char *msg)
 {
@@ -1121,7 +733,7 @@ static void check_loc(Token *tok, uint32_t line, uint32_t column, const char *ms
 }
 
 typedef struct {
-    TokenType type;
+    TokenKind kind;
     const char *text;
 } ExpectedToken;
 
@@ -1130,19 +742,15 @@ typedef struct {
 static void check_stream_bytes(const char *src, size_t len, const ExpectedToken *exp, size_t n,
                                const char *msg)
 {
-    SourceFile file = { .name = "stream", .contents = (char *)src };
-    set_current_source(&file);
-
-    Token *head = tokenize(src, len);
-    add_token_metadata(head, &file);
+    Token *head = tokenize_text(src, len);
     Token *tok = head;
     int ok = 1;
     size_t i = 0;
 
     while (i < n && tok) {
         size_t len = strlen(exp[i].text);
-        if (tok->type != exp[i].type || (size_t)tok->span.length != len ||
-            memcmp(tok->span.start, exp[i].text, len) != 0) {
+        if (tok->kind != exp[i].kind || string_view_length(tok->span.text) != len ||
+            memcmp(string_view_begin(tok->span.text), exp[i].text, len) != 0) {
             ok = 0;
             break;
         }
@@ -1166,7 +774,7 @@ static void check_stream(const char *src, const ExpectedToken *exp, size_t n, co
 }
 
 // Literal decoding checks. scan_number() is pure, so the error table needs no
-// diagnostic capture; value checks run tokenize + metadata + parse_token_values.
+// diagnostic capture; value checks run the complete public lexer pipeline.
 static void check_number_error(const char *src, NumberError want, const char *msg)
 {
     NumberInfo info = scan_number(src, src + strlen(src));
@@ -1183,12 +791,8 @@ static Token *literal_token(const char *src, SourceFile *file)
 {
     file->name = "literal";
     file->contents = (char *)src;
-    set_current_source(file);
-
-    Token *tok = tokenize(src, strlen(src));
-    add_token_metadata(tok, file);
-    parse_token_values(tok);
-    return tok;
+    file->size = strlen(src);
+    return tokenize(file);
 }
 
 static void check_int_value(const char *src, int64_t val, LiteralType type, const char *msg)
@@ -1196,11 +800,11 @@ static void check_int_value(const char *src, int64_t val, LiteralType type, cons
     SourceFile file = { 0 };
     Token *tok = literal_token(src, &file);
 
-    if (tok && tok->type == TOKEN_NUMBER && tok->val == val && tok->literal == type) {
+    if (tok && tok->kind == TOK_NUMBER && tok->value.integer == val && tok->literal == type) {
         printf("ok   : %s\n", msg);
     } else {
-        printf("FAIL : %s (type %d, val %lld, lit %d)\n", msg, tok ? (int)tok->type : -1,
-               tok ? (long long)tok->val : 0LL, tok ? (int)tok->literal : -1);
+        printf("FAIL : %s (type %d, val %lld, lit %d)\n", msg, tok ? (int)tok->kind : -1,
+               tok ? (long long)tok->value.integer : 0LL, tok ? (int)tok->literal : -1);
         failures++;
     }
     token_free(tok);
@@ -1211,11 +815,11 @@ static void check_float_value(const char *src, long double fval, LiteralType typ
     SourceFile file = { 0 };
     Token *tok = literal_token(src, &file);
 
-    if (tok && tok->type == TOKEN_NUMBER && tok->fval == fval && tok->literal == type) {
+    if (tok && tok->kind == TOK_NUMBER && tok->value.floating == fval && tok->literal == type) {
         printf("ok   : %s\n", msg);
     } else {
-        printf("FAIL : %s (type %d, fval %Lf, lit %d)\n", msg, tok ? (int)tok->type : -1,
-               tok ? tok->fval : 0.0L, tok ? (int)tok->literal : -1);
+        printf("FAIL : %s (type %d, fval %Lf, lit %d)\n", msg, tok ? (int)tok->kind : -1,
+               tok ? tok->value.floating : 0.0L, tok ? (int)tok->literal : -1);
         failures++;
     }
     token_free(tok);
@@ -1226,11 +830,11 @@ static void check_char_value(const char *src, int64_t val, const char *msg)
     SourceFile file = { 0 };
     Token *tok = literal_token(src, &file);
 
-    if (tok && tok->type == TOKEN_CHAR && tok->val == val && tok->literal == LITERAL_INT) {
+    if (tok && tok->kind == TOK_CHARACTER && tok->value.integer == val && tok->literal == LITERAL_INT) {
         printf("ok   : %s\n", msg);
     } else {
-        printf("FAIL : %s (type %d, val %lld)\n", msg, tok ? (int)tok->type : -1,
-               tok ? (long long)tok->val : 0LL);
+        printf("FAIL : %s (type %d, val %lld)\n", msg, tok ? (int)tok->kind : -1,
+               tok ? (long long)tok->value.integer : 0LL);
         failures++;
     }
     token_free(tok);
@@ -1241,11 +845,14 @@ static void check_string_value(const char *src, const char *want, int want_len, 
     SourceFile file = { 0 };
     Token *tok = literal_token(src, &file);
 
-    if (tok && tok->type == TOKEN_STRING && tok->str && tok->str_len == want_len &&
-        memcmp(tok->str, want, (size_t)want_len) == 0) {
+    if (tok && tok->kind == TOK_STRING && tok->str && tok->str_len == want_len &&
+        memcmp(tok->str, want, (size_t)want_len) == 0 && tok->next &&
+        tok->next->kind == TOK_EOF && !tok->next->next &&
+        string_view_begin(tok->span.text) == src &&
+        string_view_end(tok->span.text) == src + strlen(src)) {
         printf("ok   : %s\n", msg);
     } else {
-        printf("FAIL : %s (type %d, len %d)\n", msg, tok ? (int)tok->type : -1,
+        printf("FAIL : %s (type %d, len %d)\n", msg, tok ? (int)tok->kind : -1,
                tok ? tok->str_len : -1);
         failures++;
     }
@@ -1279,19 +886,39 @@ static void check_utf8(uint32_t cp, const char *want, int want_len, const char *
     }
 }
 
+// Verify that every fixed token metadata entry round-trips through the lexer
+// to its exact kind; one failure identifies the first divergent inventory row.
+static void check_fixed_token_inventory(void)
+{
+    for (TokenKind kind = 0; kind < TOK_KIND_COUNT; kind++) {
+        if (!token_kind_is_keyword(kind) && !token_kind_is_punctuator(kind))
+            continue;
+        const char *spelling = token_kind_spelling(kind);
+        Token *tokens = tokenize_text(spelling, strlen(spelling));
+        bool matches = tokens && tokens->kind == kind && tokens->next &&
+                       tokens->next->kind == TOK_EOF && !tokens->next->next;
+        token_free(tokens);
+        if (!matches) {
+            printf("FAIL : fixed token inventory diverges at %s\n",
+                   token_kind_name(kind));
+            failures++;
+            return;
+        }
+    }
+    printf("ok   : every fixed token spelling maps to its exact kind\n");
+}
+
 static int run_tests(void)
 {
+    check_fixed_token_inventory();
+
     // Tab-indented source: display columns must match diagnostics.
     char src[] = "int main()\n"
                  "{\n"
                  "\treturn 0;\n"
                  "}\n";
 
-    SourceFile file = { .name = "lexer_test.c", .contents = src };
-    set_current_source(&file);
-
-    Token *tokens = tokenize(src, strlen(src));
-    add_token_metadata(tokens, &file);
+    Token *tokens = tokenize_text(src, strlen(src));
 
     Token *t = tokens;
     check_loc(t, 1, 1, "int");
@@ -1317,7 +944,7 @@ static int run_tests(void)
     // Every token, including EOF, carries the source file.
     int file_ok = 1;
     for (Token *p = tokens; p; p = p->next)
-        if (p->span.file != &file)
+        if (p->span.file != &g_test_source)
             file_ok = 0;
 
     if (file_ok) {
@@ -1329,14 +956,10 @@ static int run_tests(void)
 
     // UTF-8 is counted by code point, not by byte.
     char src2[] = "char *s = \"\xc3\xa9\"; int x;\n";
-    SourceFile file2 = { .name = "lexer_test2.c", .contents = src2 };
-    set_current_source(&file2);
-
-    Token *tokens2 = tokenize(src2, strlen(src2));
-    add_token_metadata(tokens2, &file2);
+    Token *tokens2 = tokenize_text(src2, strlen(src2));
 
     Token *i = tokens2;
-    while (i && !(i->type == TOKEN_KEYWORD && i->span.length == 3))
+    while (i && i->kind != TOK_KW_INT)
         i = i->next;
 
     check_loc(i, 1, 16, "int after UTF-8 string");
@@ -1346,10 +969,12 @@ static int run_tests(void)
 
     // Full token-stream assertion: comments are skipped, literals classified.
     const ExpectedToken exp[] = {
-        { TOKEN_KEYWORD, "int" },  { TOKEN_IDENT, "main" }, { TOKEN_PUNCT, "(" },
-        { TOKEN_PUNCT, ")" },      { TOKEN_PUNCT, "{" },    { TOKEN_KEYWORD, "return" },
-        { TOKEN_NUMBER, "0" },     { TOKEN_PUNCT, ";" },    { TOKEN_PUNCT, "}" },
-        { TOKEN_STRING, "\"s\"" }, { TOKEN_CHAR, "'c'" },   { TOKEN_EOF, "" },
+        { TOK_KW_INT, "int" },       { TOK_IDENTIFIER, "main" },
+        { TOK_LPAREN, "(" },         { TOK_RPAREN, ")" },
+        { TOK_LBRACE, "{" },         { TOK_KW_RETURN, "return" },
+        { TOK_NUMBER, "0" },         { TOK_SEMICOLON, ";" },
+        { TOK_RBRACE, "}" },
+        { TOK_STRING, "\"s\"" }, { TOK_CHARACTER, "'c'" },   { TOK_EOF, "" },
     };
     check_stream("int main() { return 0; } // line\n/* block */ \"s\" 'c'\n", exp,
                  sizeof(exp) / sizeof(*exp), "token stream (comments, string, char)");
@@ -1365,17 +990,26 @@ static int run_tests(void)
     check_number_error("1e+", NUMBER_EXPONENT_HAS_NO_DIGITS, "reject empty exponent");
     check_number_error("0x1p", NUMBER_EXPONENT_HAS_NO_DIGITS, "reject empty hex exponent");
     check_number_error("08", NUMBER_INVALID_DIGIT_OCTAL, "reject octal 8");
+#if GNU_EXTENSION
     check_number_error("0b102", NUMBER_INVALID_DIGIT_BINARY, "reject binary 2");
+#endif
     check_number_error("1.2.3", NUMBER_TOO_MANY_DECIMAL_POINTS, "reject two decimal points");
     check_number_error("0x.5", NUMBER_HEX_FLOAT_REQUIRES_EXPONENT, "reject hex float without p");
+#if GNU_EXTENSION
     check_number_error("0b1.0", NUMBER_BINARY_FLOAT_PREFIX, "reject binary float prefix");
+#else
+    check_number_error("0b101", NUMBER_INVALID_SUFFIX_INTEGER,
+                       "strict mode leaves the binary prefix to the decimal path");
+#endif
     check_number_error(".0foo", NUMBER_INVALID_SUFFIX_FLOATING, "reject suffix after leading dot");
     check_number_error("0x.p1", NUMBER_HEX_FLOAT_NO_DIGITS, "reject hex float without digits");
 
     // Decoded values and the C11 type each spelling implies.
     check_int_value("42", 42, LITERAL_INT, "decimal int value");
     check_int_value("0xff", 255, LITERAL_INT, "hex int value");
+#if GNU_EXTENSION
     check_int_value("0b1010", 10, LITERAL_INT, "binary int value");
+#endif
     check_int_value("0123", 83, LITERAL_INT, "octal int value");
     check_int_value("0xffffffff", 4294967295LL, LITERAL_UINT, "hex unsigned int type");
     check_int_value("4294967296", 4294967296LL, LITERAL_LONG, "wide decimal is long");
@@ -1388,6 +1022,26 @@ static int run_tests(void)
     check_char_value("'A'", 65, "char literal");
     check_char_value("'\\n'", 10, "char escape");
     check_string_value("\"a\\n\\x41\\101\"", "a\nAA", 4, "string escapes");
+    check_string_value("\"a\" \"b\"", "ab", 2,
+                       "adjacent string literals concatenate");
+    check_string_value("\"a\"/* gap */\n\"b\" \"c\"", "abc", 3,
+                       "comments and newlines preserve string adjacency");
+    check_string_value("\"a\\0\" \"b\"", "a\0b", 3,
+                       "concatenation preserves embedded NUL bytes");
+#if GNU_EXTENSION
+    check_string_value("\"\\e\"", "\x1b", 1, "GNU \\e escape");
+#else
+    {
+        int errors = error_count();
+        check_string_value("\"\\e\"", "\x1b", 1, "strict mode still decodes \\e");
+        if (error_count() == errors + 1)
+            printf("ok   : strict mode diagnoses \\e\n");
+        else {
+            printf("FAIL : strict mode diagnoses \\e\n");
+            failures++;
+        }
+    }
+#endif
 
     // Universal character names: spelling rules and UTF-8 expansion.
     check_ucn("u12", UCN_INCOMPLETE, 0, "UCN u12 is incomplete");
@@ -1421,19 +1075,34 @@ static int run_tests(void)
 
     // C11 keywords and the '$' identifier extension.
     const ExpectedToken kw_exp[] = {
-        { TOKEN_KEYWORD, "inline" },     { TOKEN_KEYWORD, "_Static_assert" },
-        { TOKEN_KEYWORD, "_Generic" },   { TOKEN_KEYWORD, "_Complex" },
-        { TOKEN_KEYWORD, "_Imaginary" }, { TOKEN_EOF, "" },
+        { TOK_KW_INLINE, "inline" },
+        { TOK_KW_STATIC_ASSERT, "_Static_assert" },
+        { TOK_KW_GENERIC, "_Generic" },
+        { TOK_KW_COMPLEX, "_Complex" },
+        { TOK_KW_IMAGINARY, "_Imaginary" },
+        { TOK_EOF, "" },
     };
     check_stream("inline _Static_assert _Generic _Complex _Imaginary\n", kw_exp,
                  sizeof(kw_exp) / sizeof(*kw_exp), "C11 keywords are classified");
 
+    const ExpectedToken keyword_prefix_exp[] = {
+        { TOK_IDENTIFIER, "inline_value" },
+        { TOK_IDENTIFIER, "returning" },
+        { TOK_IDENTIFIER, "_GenericValue" },
+        { TOK_EOF, "" },
+    };
+    check_stream("inline_value returning _GenericValue\n", keyword_prefix_exp,
+                 sizeof(keyword_prefix_exp) / sizeof(*keyword_prefix_exp),
+                 "keyword prefixes remain identifiers");
+
+#if GNU_EXTENSION
     const ExpectedToken dollar_exp[] = {
-        { TOKEN_IDENT, "$dollar" },
-        { TOKEN_EOF, "" },
+        { TOK_IDENTIFIER, "$dollar" },
+        { TOK_EOF, "" },
     };
     check_stream("$dollar\n", dollar_exp, sizeof(dollar_exp) / sizeof(*dollar_exp),
                  "dollar sign is an identifier character");
+#endif
 
     // Binary constants take the integer-suffix error path, not the float prefix.
     check_number_error("0b1p3", NUMBER_INVALID_SUFFIX_INTEGER, "reject binary p suffix");
@@ -1457,10 +1126,7 @@ static int run_tests(void)
 
     // A lone CR also ends a line (a CRLF pair counts once).
     char src3[] = "int a;\r\nint b;\rint c;";
-    SourceFile file3 = { .name = "lexer_test3.c", .contents = src3 };
-    set_current_source(&file3);
-    Token *tokens3 = tokenize(src3, strlen(src3));
-    add_token_metadata(tokens3, &file3);
+    Token *tokens3 = tokenize_text(src3, strlen(src3));
     Token *t3 = tokens3;
     for (int i = 0; i < 3; i++)
         t3 = t3->next;
@@ -1473,9 +1139,9 @@ static int run_tests(void)
     // NUL bytes are skipped instead of ending the file.
     char src4[] = "int a;\0 int b;";
     const ExpectedToken nul_exp[] = {
-        { TOKEN_KEYWORD, "int" }, { TOKEN_IDENT, "a" }, { TOKEN_PUNCT, ";" },
-        { TOKEN_KEYWORD, "int" }, { TOKEN_IDENT, "b" }, { TOKEN_PUNCT, ";" },
-        { TOKEN_EOF, "" },
+        { TOK_KW_INT, "int" }, { TOK_IDENTIFIER, "a" }, { TOK_SEMICOLON, ";" },
+        { TOK_KW_INT, "int" }, { TOK_IDENTIFIER, "b" }, { TOK_SEMICOLON, ";" },
+        { TOK_EOF, "" },
     };
     check_stream_bytes(src4, sizeof(src4) - 1, nul_exp, sizeof(nul_exp) / sizeof(*nul_exp),
                        "NUL bytes are ignored");
@@ -1483,10 +1149,10 @@ static int run_tests(void)
     // NUL inside a comment is data: it must not end the comment early.
     char src5[] = "int a; // c\0 @\n";
     const ExpectedToken line_comment_exp[] = {
-        { TOKEN_KEYWORD, "int" },
-        { TOKEN_IDENT, "a" },
-        { TOKEN_PUNCT, ";" },
-        { TOKEN_EOF, "" },
+        { TOK_KW_INT, "int" },
+        { TOK_IDENTIFIER, "a" },
+        { TOK_SEMICOLON, ";" },
+        { TOK_EOF, "" },
     };
     check_stream_bytes(src5, sizeof(src5) - 1, line_comment_exp,
                        sizeof(line_comment_exp) / sizeof(*line_comment_exp),
@@ -1494,9 +1160,9 @@ static int run_tests(void)
 
     char src6[] = "int a; /* c\0*/ int b;";
     const ExpectedToken block_comment_exp[] = {
-        { TOKEN_KEYWORD, "int" }, { TOKEN_IDENT, "a" }, { TOKEN_PUNCT, ";" },
-        { TOKEN_KEYWORD, "int" }, { TOKEN_IDENT, "b" }, { TOKEN_PUNCT, ";" },
-        { TOKEN_EOF, "" },
+        { TOK_KW_INT, "int" }, { TOK_IDENTIFIER, "a" }, { TOK_SEMICOLON, ";" },
+        { TOK_KW_INT, "int" }, { TOK_IDENTIFIER, "b" }, { TOK_SEMICOLON, ";" },
+        { TOK_EOF, "" },
     };
     check_stream_bytes(src6, sizeof(src6) - 1, block_comment_exp,
                        sizeof(block_comment_exp) / sizeof(*block_comment_exp),
@@ -1504,13 +1170,9 @@ static int run_tests(void)
 
     // NUL inside a literal is preserved (GCC keeps it too).
     char src7[] = "char s[] = \"a\0b\";";
-    SourceFile file7 = { .name = "lexer_test4.c", .contents = src7 };
-    set_current_source(&file7);
-    Token *tokens7 = tokenize(src7, sizeof(src7) - 1);
-    add_token_metadata(tokens7, &file7);
-    parse_token_values(tokens7);
+    Token *tokens7 = tokenize_text(src7, sizeof(src7) - 1);
     Token *t7 = tokens7;
-    while (t7 && t7->type != TOKEN_STRING)
+    while (t7 && t7->kind != TOK_STRING)
         t7 = t7->next;
     if (t7 && t7->str_len == 3 && t7->str[0] == 'a' && t7->str[1] == '\0' && t7->str[2] == 'b') {
         printf("ok   : NUL inside a string literal is preserved\n");
@@ -1521,12 +1183,8 @@ static int run_tests(void)
     token_free(tokens7);
 
     char src8[] = "'a\0b'";
-    SourceFile file8 = { .name = "lexer_test5.c", .contents = src8 };
-    set_current_source(&file8);
-    Token *tokens8 = tokenize(src8, sizeof(src8) - 1);
-    add_token_metadata(tokens8, &file8);
-    parse_token_values(tokens8);
-    if (tokens8 && tokens8->type == TOKEN_CHAR && tokens8->val == 0x610062) {
+    Token *tokens8 = tokenize_text(src8, sizeof(src8) - 1);
+    if (tokens8 && tokens8->kind == TOK_CHARACTER && tokens8->value.integer == 0x610062) {
         printf("ok   : NUL inside a character constant packs as a byte\n");
     } else {
         printf("FAIL : NUL inside a character constant\n");
@@ -1535,10 +1193,10 @@ static int run_tests(void)
     token_free(tokens8);
 
     // Last diagnostic check: \x without hex digits reports and contributes no
-    // bytes. Earlier checks must stay error-free, so had_error() is still false.
+    // bytes. Earlier checks must stay error-free, so error_count() is still 0.
     SourceFile err_file = { 0 };
     Token *bad = literal_token("\"\\x\"", &err_file);
-    if (bad && bad->type == TOKEN_STRING && bad->str_len == 0 && had_error()) {
+    if (bad && bad->kind == TOK_STRING && bad->str_len == 0 && error_count() > 0) {
         printf("ok   : \\x without hex digits is diagnosed\n");
     } else {
         printf("FAIL : \\x without hex digits was accepted\n");
@@ -1554,34 +1212,12 @@ static int run_tests(void)
     return 0;
 }
 
-// Debug aid: print a token list as "TYPE<tab>text", one token per line.
-static const char *token_type_name(TokenType type)
-{
-    switch (type) {
-    case TOKEN_KEYWORD:
-        return "KEYWORD";
-    case TOKEN_IDENT:
-        return "IDENT";
-    case TOKEN_NUMBER:
-        return "NUMBER";
-    case TOKEN_CHAR:
-        return "CHAR";
-    case TOKEN_PUNCT:
-        return "PUNCT";
-    case TOKEN_EOF:
-        return "EOF";
-    case TOKEN_STRING:
-        return "STRING";
-    default:
-        return "UNKNOWN";
-    }
-}
-
 static void dump_tokens(Token *tok)
 {
     for (; tok; tok = tok->next) {
-        printf("%-10s", token_type_name(tok->type));
-        fwrite(tok->span.start, 1, tok->span.length, stdout);
+        printf("%-18s", token_kind_name(tok->kind));
+        fwrite(string_view_begin(tok->span.text), 1,
+               string_view_length(tok->span.text), stdout);
         putchar('\n');
     }
 }
@@ -1604,7 +1240,7 @@ int main(int argc, char **argv)
     token_free(tokens);
     source_free(current_source());
 
-    return had_error() ? 1 : 0;
+    return error_count() > 0 ? 1 : 0;
 }
 
 #endif

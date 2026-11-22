@@ -1,6 +1,8 @@
 #ifndef SOURCE_H
 #define SOURCE_H
 
+#include "util/common.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -10,14 +12,13 @@ typedef struct SourceFile {
     size_t size; // byte length of contents (UTF-8 BOM stripped by source_load)
 } SourceFile;
 
-// A resolved region of a source file: start pointer + byte length, plus the
-// 1-based start line and display column. Filled in phases:
-//   tokenize           -> start, length
-//   add_token_metadata -> file, line, column   (lexer.c, after lexing)
+// A resolved region of a source file: borrowed text plus the 1-based start line
+// and display column. The lexer builds it in phases internally:
+//   scan_tokens         -> text
+//   tokenize metadata   -> file, line, column
 typedef struct {
     SourceFile *file;
-    const char *start;
-    int length; // byte length of the span; bounded by the file size
+    StringView text; // byte range borrowed from file->contents
     unsigned int line;
     unsigned int column;
 } SourceSpan;
@@ -40,10 +41,10 @@ static inline int display_width_step(int width, unsigned char c)
 }
 
 // Display width of the first `len` bytes of `str`.
-static inline int display_width(const char *str, int len)
+static inline int display_width(const char *str, size_t len)
 {
     int width = 0;
-    for (int i = 0; i < len; i++)
+    for (size_t i = 0; i < len; i++)
         width = display_width_step(width, (unsigned char)str[i]);
     return width;
 }
@@ -82,10 +83,15 @@ void source_free(SourceFile *file);
 // module.
 SourceSpan source_span(const char *start, const char *end);
 
-// The file currently being processed. Only the driver should set it; read-only
-// consumers (lexer, diagnostics) use current_source(). Keeping the storage
-// behind accessors lets it later become thread-local or context-scoped without
-// changing callers.
+// Join two spans of the same file into the smallest span covering both. Line/
+// column are resolved against the spans' own file, so merging still works after
+// current_source() moved on; both spans must carry the same file. Different
+// files are an internal contract violation.
+SourceSpan source_span_join(const SourceSpan *a, const SourceSpan *b);
+
+// The file currently being processed. The driver or complete lexer entry sets
+// it; diagnostics and later stages read it. Keeping storage behind accessors
+// lets it later become context-scoped without changing callers.
 SourceFile *current_source(void);
 void set_current_source(SourceFile *file);
 

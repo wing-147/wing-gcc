@@ -1,7 +1,11 @@
 bin/
-.agents-log/
-test.txt
-AGENTS.md
+*.txt
+**/.agents/
+**/AGENTS.md
 TODO.md
 reference/
 .vscode/
+__pycache__/
+SYNTAX_COVERAGE.md
+*.patch
+review.md

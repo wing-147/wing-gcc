@@ -21,41 +21,41 @@
 #define CAPACITY_GROWTH_FACTOR 2
 
 // Represents a deleted hash entry
-#define TOMBSTONE ((void *)-1)
+#define TOMBSTONE ((const char *)-1)
 
 // Calculate hash value of a key using the FNV-1 algorithm.
-static uint64_t fnv_hash(const char *s, size_t len)
+static uint64_t fnv_hash(StringView key)
 {
     uint64_t hash = 0xcbf29ce484222325;
-    for (size_t i = 0; i < len; i++) {
+    for (size_t i = 0; i < string_view_length(key); i++) {
         hash *= 0x100000001b3;
-        hash ^= (unsigned char)s[i];
+        hash ^= (unsigned char)string_view_begin(key)[i];
     }
     return hash;
 }
 
 // Check whether a hash entry matches the given key.
-static bool match(const HashEntry *ent, const char *key, size_t key_len)
+static bool match(const HashEntry *ent, StringView key)
 {
-    return ent->key && ent->key != TOMBSTONE && ent->key_len == key_len &&
-           !memcmp(ent->key, key, key_len);
+    return string_view_begin(ent->key) && string_view_begin(ent->key) != TOMBSTONE &&
+           string_view_equal(ent->key, key);
 }
 
 // Find an existing entry with the specified key.
-static HashEntry *find_entry(const HashMap *map, const char *key, size_t key_len)
+static HashEntry *find_entry(const HashMap *map, StringView key)
 {
     if (!map->buckets) {
         return NULL;
     }
 
-    uint64_t hash = fnv_hash(key, key_len);
+    uint64_t hash = fnv_hash(key);
 
     for (size_t i = 0; i < map->capacity; i++) {
         HashEntry *ent = &map->buckets[(hash + i) % map->capacity];
-        if (ent->key == NULL) {
+        if (string_view_begin(ent->key) == NULL) {
             return NULL;
         }
-        if (match(ent, key, key_len)) {
+        if (match(ent, key)) {
             return ent;
         }
     }
@@ -66,28 +66,26 @@ static HashEntry *find_entry(const HashMap *map, const char *key, size_t key_len
 // A tombstone is only reused after the rest of the probe chain has been
 // searched: a live entry for the same key may sit behind it, and inserting in
 // front would create a duplicate that deletion leaves behind as a stale value.
-static HashEntry *find_or_create_entry(HashMap *map, const char *key, size_t key_len)
+static HashEntry *find_or_create_entry(HashMap *map, StringView key)
 {
-    uint64_t hash = fnv_hash(key, key_len);
+    uint64_t hash = fnv_hash(key);
     HashEntry *tombstone = NULL;
 
     for (size_t i = 0; i < map->capacity; i++) {
         HashEntry *ent = &map->buckets[(hash + i) % map->capacity];
-        if (match(ent, key, key_len)) {
+        if (match(ent, key)) {
             return ent;
         }
-        if (ent->key == TOMBSTONE) {
+        if (string_view_begin(ent->key) == TOMBSTONE) {
             if (!tombstone) {
                 tombstone = ent;
             }
-        } else if (ent->key == NULL) {
+        } else if (string_view_begin(ent->key) == NULL) {
             if (tombstone) {
                 tombstone->key = key;
-                tombstone->key_len = key_len;
                 return tombstone;
             }
             ent->key = key;
-            ent->key_len = key_len;
             map->used++;
             return ent;
         }
@@ -101,7 +99,8 @@ static void hashmap_rehash(HashMap *map)
 {
     size_t key_count = 0;
     for (size_t i = 0; i < map->capacity; i++) {
-        if (map->buckets[i].key && map->buckets[i].key != TOMBSTONE) {
+        if (string_view_begin(map->buckets[i].key) &&
+            string_view_begin(map->buckets[i].key) != TOMBSTONE) {
             key_count++;
         }
     }
@@ -117,8 +116,8 @@ static void hashmap_rehash(HashMap *map)
 
     for (size_t i = 0; i < map->capacity; i++) {
         HashEntry *ent = &map->buckets[i];
-        if (ent->key && ent->key != TOMBSTONE) {
-            HashEntry *ent2 = find_or_create_entry(&tmp, ent->key, ent->key_len);
+        if (string_view_begin(ent->key) && string_view_begin(ent->key) != TOMBSTONE) {
+            HashEntry *ent2 = find_or_create_entry(&tmp, ent->key);
             ent2->val = ent->val;
         }
     }
@@ -127,23 +126,15 @@ static void hashmap_rehash(HashMap *map)
     *map = tmp;
 }
 
-// Get value associated with a key range.
-// This version supports lexer tokens that are not null-terminated.
-void *hashmap_get_range(const HashMap *map, const char *key, size_t key_len)
+// Get the value associated with one borrowed byte-view key.
+void *hashmap_get(const HashMap *map, StringView key)
 {
-    HashEntry *ent = find_entry(map, key, key_len);
+    HashEntry *ent = find_entry(map, key);
     return ent ? ent->val : NULL;
 }
 
-// Get value associated with a null-terminated string key.
-void *hashmap_get(const HashMap *map, const char *key)
-{
-    return hashmap_get_range(map, key, strlen(key));
-}
-
-// Insert key-value pair using an explicit key length.
-// Stores the association between key and user-provided value.
-void hashmap_put_range(HashMap *map, const char *key, size_t key_len, void *value)
+// Insert or replace one borrowed byte-view key and caller-provided value.
+void hashmap_put(HashMap *map, StringView key, void *value)
 {
     if (!map->buckets) {
         map->buckets = xcalloc(INITIAL_CAPACITY, sizeof(HashEntry));
@@ -152,29 +143,16 @@ void hashmap_put_range(HashMap *map, const char *key, size_t key_len, void *valu
         hashmap_rehash(map);
     }
 
-    HashEntry *ent = find_or_create_entry(map, key, key_len);
+    HashEntry *ent = find_or_create_entry(map, key);
     ent->val = value;
 }
 
-// Insert key-value pair using a null-terminated string key.
-void hashmap_put(HashMap *map, const char *key, void *value)
+// Delete the value associated with one borrowed byte-view key.
+void hashmap_delete(HashMap *map, StringView key)
 {
-    hashmap_put_range(map, key, strlen(key), value);
-}
-
-// Delete value associated with a key range.
-void hashmap_delete_range(HashMap *map, const char *key, size_t key_len)
-{
-    HashEntry *ent = find_entry(map, key, key_len);
-    if (ent) {
-        ent->key = TOMBSTONE;
-    }
-}
-
-// Delete value associated with a null-terminated string key.
-void hashmap_delete(HashMap *map, const char *key)
-{
-    hashmap_delete_range(map, key, strlen(key));
+    HashEntry *ent = find_entry(map, key);
+    if (ent)
+        ent->key = string_view(TOMBSTONE, 0);
 }
 
 // Release the bucket array. Keys and values are owned by the caller.
@@ -206,52 +184,69 @@ void hashmap_test(void)
     }
 
     for (int i = 0; i < 5000; i++)
-        hashmap_put(&map, keys[i], (void *)(size_t)i);
+        hashmap_put(&map, string_view_from_cstr(keys[i]), (void *)(size_t)i);
 
     for (int i = 1000; i < 2000; i++)
-        hashmap_delete(&map, keys[i]);
+        hashmap_delete(&map, string_view_from_cstr(keys[i]));
 
     for (int i = 1500; i < 1600; i++)
-        hashmap_put(&map, keys[i], (void *)(size_t)i);
+        hashmap_put(&map, string_view_from_cstr(keys[i]), (void *)(size_t)i);
 
     for (int i = 6000; i < 7000; i++)
-        hashmap_put(&map, keys[i], (void *)(size_t)i);
+        hashmap_put(&map, string_view_from_cstr(keys[i]), (void *)(size_t)i);
 
     for (int i = 0; i < 1000; i++)
-        assert((size_t)hashmap_get(&map, keys[i]) == (size_t)i);
+        assert((size_t)hashmap_get(&map, string_view_from_cstr(keys[i])) ==
+               (size_t)i);
 
     for (int i = 1000; i < 1500; i++)
-        assert(hashmap_get(&map, keys[i]) == NULL);
+        assert(hashmap_get(&map, string_view_from_cstr(keys[i])) == NULL);
 
     for (int i = 1500; i < 1600; i++)
-        assert((size_t)hashmap_get(&map, keys[i]) == (size_t)i);
+        assert((size_t)hashmap_get(&map, string_view_from_cstr(keys[i])) ==
+               (size_t)i);
 
     for (int i = 1600; i < 2000; i++)
-        assert(hashmap_get(&map, keys[i]) == NULL);
+        assert(hashmap_get(&map, string_view_from_cstr(keys[i])) == NULL);
 
     for (int i = 2000; i < 5000; i++)
-        assert((size_t)hashmap_get(&map, keys[i]) == (size_t)i);
+        assert((size_t)hashmap_get(&map, string_view_from_cstr(keys[i])) ==
+               (size_t)i);
 
     for (int i = 5000; i < 6000; i++)
-        assert(hashmap_get(&map, keys[i]) == NULL);
+        assert(hashmap_get(&map, string_view_from_cstr(keys[i])) == NULL);
 
     for (int i = 6000; i < 7000; i++)
-        assert((size_t)hashmap_get(&map, keys[i]) == (size_t)i);
+        assert((size_t)hashmap_get(&map, string_view_from_cstr(keys[i])) ==
+               (size_t)i);
 
-    assert(hashmap_get(&map, "no such key") == NULL);
+    assert(hashmap_get(&map, string_view_from_cstr("no such key")) == NULL);
 
     // "k9" and "k12" share the initial bucket, so k9's tombstone sits in front
     // of k12's live slot. Re-inserting k12 must update that slot instead of
     // adding a duplicate: otherwise deleting it would resurrect the old value.
     HashMap dup = { 0 };
-    hashmap_put(&dup, "k9", (void *)(size_t)1);
-    hashmap_put(&dup, "k12", (void *)(size_t)2);
-    hashmap_delete(&dup, "k9");
-    hashmap_put(&dup, "k12", (void *)(size_t)3);
-    assert((size_t)hashmap_get(&dup, "k12") == 3);
-    hashmap_delete(&dup, "k12");
-    assert(hashmap_get(&dup, "k12") == NULL);
+    hashmap_put(&dup, string_view_from_cstr("k9"), (void *)(size_t)1);
+    hashmap_put(&dup, string_view_from_cstr("k12"), (void *)(size_t)2);
+    hashmap_delete(&dup, string_view_from_cstr("k9"));
+    hashmap_put(&dup, string_view_from_cstr("k12"), (void *)(size_t)3);
+    assert((size_t)hashmap_get(&dup, string_view_from_cstr("k12")) == 3);
+    hashmap_delete(&dup, string_view_from_cstr("k12"));
+    assert(hashmap_get(&dup, string_view_from_cstr("k12")) == NULL);
     hashmap_free(&dup);
+
+    // A map key is an explicit byte view rather than a NUL-terminated string;
+    // bytes after an embedded NUL remain part of its identity.
+    char embedded_key[] = { 'a', '\0', 'b' };
+    char short_key[] = { 'a' };
+    HashMap views = { 0 };
+    hashmap_put(&views, string_view(embedded_key, sizeof(embedded_key)),
+                (void *)(size_t)7);
+    assert((size_t)hashmap_get(
+               &views, string_view(embedded_key, sizeof(embedded_key))) == 7);
+    assert(hashmap_get(&views, string_view(short_key, sizeof(short_key))) ==
+           NULL);
+    hashmap_free(&views);
 
     hashmap_free(&map);
 

@@ -2,7 +2,7 @@ CC=gcc
 
 CFLAGS=-Wall -Wextra -g -Iinclude
 
-SRC=$(wildcard src/*.c src/*/*.c)
+SRC=$(wildcard src/*.c src/*/*.c src/*/*/*.c)
 
 OUTPUT=bin/
 
@@ -18,7 +18,8 @@ wing-gcc: mk_output_dir
 
 lexer_test: mk_output_dir
 	$(CC) $(CFLAGS) -DTEST_LEXER \
-	src/frontend/lexer.c src/util/diagnostic.c src/util/hashmap.c src/util/source.c src/util/common.c \
+	$(wildcard src/frontend/lexer/*.c) \
+	src/util/diagnostic.c src/util/source.c src/util/common.c \
 	-o $(OUTPUT)$@
 
 hashmap_test: mk_output_dir
@@ -36,11 +37,18 @@ source_test: mk_output_dir
 	src/util/source.c src/util/diagnostic.c src/util/common.c \
 	-o $(OUTPUT)$@
 
-check: wing-gcc lexer_test diagnostic_test source_test hashmap_test
+parser_test: mk_output_dir
+	$(CC) $(CFLAGS) -DTEST_PARSER \
+	$(wildcard src/frontend/parser/*.c) $(wildcard src/frontend/lexer/*.c) \
+	src/util/diagnostic.c src/util/source.c src/util/common.c src/util/hashmap.c \
+	-o $(OUTPUT)$@
+
+check: wing-gcc lexer_test diagnostic_test source_test hashmap_test parser_test
 	./bin/source_test
 	./bin/diagnostic_test
 	./bin/hashmap_test
 	./bin/lexer_test
+	./bin/parser_test
 	./bin/lexer_test tests/tests/basic.c > /dev/null
 	./bin/wing-gcc tests/tests/basic.c > /dev/null
 	@echo "all checks passed"

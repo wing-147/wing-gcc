@@ -21,11 +21,11 @@ static int g_errors = 0;
 
 // Print `str[0..len)` with tabs expanded to spaces, so that the caret on the
 // following line lines up with the rendered source line.
-static void print_source_line(const char *str, int len)
+static void print_source_line(const char *str, size_t len)
 {
     int width = 0;
 
-    for (int i = 0; i < len; i++) {
+    for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)str[i];
         int next = display_width_step(width, c);
 
@@ -52,12 +52,12 @@ static const char *diag_name(DiagKind kind)
 //         |            ^
 static void vdiagnostic(DiagKind kind, const SourceSpan *span, const char *format, va_list ap)
 {
-    // Find the beginning and end of the line containing `span->start`.
-    const char *line_start = span->start;
+    // Find the beginning and end of the line containing the diagnosed range.
+    const char *line_start = string_view_begin(span->text);
     while (line_start > span->file->contents && !is_line_break(line_start[-1]))
         line_start--;
 
-    const char *line_end = span->start;
+    const char *line_end = string_view_begin(span->text);
     while (*line_end && !is_line_break(*line_end))
         line_end++;
 
@@ -74,13 +74,13 @@ static void vdiagnostic(DiagKind kind, const SourceSpan *span, const char *forma
     fputc('\n', stderr);
 
     // Caret line. Underline the whole span, clamped to the line end.
-    int length = span->length;
+    size_t length = string_view_length(span->text);
     if (length < 1)
         length = 1;
-    if (span->start + length > line_end)
-        length = line_end - span->start;
+    if (string_view_begin(span->text) + length > line_end)
+        length = (size_t)(line_end - string_view_begin(span->text));
 
-    int caret = display_width(span->start, length);
+    int caret = display_width(string_view_begin(span->text), length);
     if (caret < 1)
         caret = 1;
 
@@ -90,13 +90,13 @@ static void vdiagnostic(DiagKind kind, const SourceSpan *span, const char *forma
     fputc('\n', stderr);
 }
 
-bool had_error(void)
-{
-    return g_errors > 0;
-}
 void add_error(int count)
 {
     g_errors += count;
+}
+int error_count(void)
+{
+    return g_errors;
 }
 
 void error(const char *format, ...)

@@ -1,9 +1,9 @@
-// The driver deliberately stops at lexing: later phases plug into the same
-// load -> tokenize -> release pipeline, and the exit status is decided by
-// had_error() rather than by the driver.
+// The driver runs the front end: load -> tokenize -> parse, then releases the
+// AST; later phases plug into the same pipeline. The exit status is decided by
+// error_count(), not by the driver.
 
 #include "frontend/lexer.h"
-#include "frontend/token.h"
+#include "frontend/parser.h"
 #include "util/diagnostic.h"
 #include "util/source.h"
 
@@ -24,8 +24,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    Node *root = parse(tokens);
+
+    parse_free(root);
     token_free(tokens);
     source_free(current_source());
 
-    return had_error() ? 1 : 0;
+    return error_count() > 0 ? 1 : 0;
 }

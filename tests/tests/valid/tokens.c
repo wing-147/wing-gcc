@@ -27,11 +27,13 @@ const volatile int cv = 2;
 
 _Alignas(16) static int aligned_value;
 _Atomic int atomic_value;
+_Atomic(int) atomic_type_value;
 _Bool bool_value;
 static _Thread_local int tls_value;
 __thread int gnu_tls_value;
 static int attributed __attribute__((unused));
 static inline int inline_fn(void) { return 0; }
+_Noreturn void no_return(void);
 _Static_assert(sizeof(int) >= 2, "int size");
 static int generic_value = _Generic(1, int: 1, default: 0);
 static _Complex double complex_value = 1.0;
@@ -56,6 +58,7 @@ static int helper(int a, int b)
     typeof(static_value) copy = static_value;
     int array[4] = { 0, 1, 2, 3 };
     struct point p = { 1, 2 };
+    struct point compound = (struct point){ .x = 3, .y = 4 };
     struct point *p_ptr = &p;
     union value v = { .i = 3 };
     enum color c = RED;

@@ -3,11 +3,11 @@
 
 #include "util/source.h"
 
-#include <stdbool.h>
-
-// True once any error has been reported (warnings do not set it).
-bool had_error(void);
 void add_error(int count);
+
+// Total number of errors reported so far in this process. Callers snapshot it
+// to check whether a phase reported anything new, without resetting state.
+int error_count(void);
 
 // Print a message without source location.
 void error(const char *format, ...) __attribute__((format(printf, 1, 2)));

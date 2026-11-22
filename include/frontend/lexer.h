@@ -1,14 +1,14 @@
 #ifndef LEXER_H
 #define LEXER_H
 
-#include "frontend/token.h"
+typedef struct SourceFile SourceFile;
+typedef struct Token Token;
 
-// Lex `length` bytes of `contents` into a token list (metadata and literal
-// values not yet attached). `contents`/`length` should come from
-// current_source() so diagnostics can locate errors; `contents[length]` must
-// be readable and NUL-terminated, because lookahead may inspect it. NUL bytes
-// inside the file are skipped, matching GCC.
-Token *tokenize(const char *contents, size_t length);
+// Lex one borrowed source into a fully located and decoded token list. The
+// source and its buffer must outlive the tokens; the function sets it as the
+// current source so lexical diagnostics resolve consistently. contents[size]
+// must be a readable terminating NUL; embedded NUL bytes remain permitted.
+Token *tokenize(SourceFile *source);
 
 // Load, lex, attach file/line/column metadata and decode literal values for
 // `path`. Returns the token list, or NULL on I/O failure with errno preserved.
@@ -16,8 +16,7 @@ Token *tokenize(const char *contents, size_t length);
 // tokens with token_free() and the file with source_free(current_source()).
 Token *tokenize_file(const char *path);
 
-// Release a token list produced by tokenize()/tokenize_file(). Temporary API;
-// to be removed once the parser owns token lifetime (see TODO.md).
-void token_free(Token *tok);
+// Release a token list produced by tokenize()/tokenize_file().
+void token_free(Token *tokens);
 
 #endif // LEXER_H
