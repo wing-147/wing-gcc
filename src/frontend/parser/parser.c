@@ -28,6 +28,13 @@ struct NameScope {
 static char g_ordinary_binding;
 static char g_typedef_binding;
 
+// Initialize an unlinked name scope with an empty ordinary-name table.
+static void init_name_scope(NameScope *scope, NameScope *parent)
+{
+    hashmap_init(&scope->names, HASHMAP_KEY_STRING_VIEW);
+    scope->parent = parent;
+}
+
 // ---------------------------------------------------------------------------
 // Parser primitives
 // ---------------------------------------------------------------------------
@@ -35,6 +42,12 @@ static char g_typedef_binding;
 // The primitives match exact TokenKind values. Their contract differs only in
 // reporting: consume/consume_if are silent, while expect reports once through
 // diagnostic.c.
+
+// Initialize a cursor over borrowed tokens without entering a name scope.
+void init_parser_cursor(ParserCursor *cursor, Token *tokens)
+{
+    *cursor = (ParserCursor){ .token = tokens, .scope = NULL };
+}
 
 // Unconditional advance: returns the consumed token, or NULL at EOF without
 // moving the cursor. Callers that need the token keep the result.
@@ -134,25 +147,42 @@ Token *expect_identifier(ParserCursor *cursor)
     return tok;
 }
 
-// Enter one lexical ordinary-identifier scope. The scope owns only its hash
-// buckets; token-backed spelling remains owned by the lexer.
-void parser_push_scope(ParserCursor *cursor)
+// Enter an empty lexical scope or take ownership of a saved parameter scope.
+void parser_push_scope(ParserCursor *cursor, NameScope **saved)
 {
-    NameScope *scope = xcalloc(1, sizeof(*scope));
-    scope->parent = cursor->scope;
+    NameScope *scope;
+    if (saved && *saved) {
+        scope = *saved;
+        *saved = NULL;
+        scope->parent = cursor->scope;
+    } else {
+        scope = xmalloc(sizeof(*scope));
+        init_name_scope(scope, cursor->scope);
+    }
     cursor->scope = scope;
 }
 
-// Leave the current lexical scope and restore its parent. Every parser entry
-// that pushes a scope must pop it on both success and failure paths.
-void parser_pop_scope(ParserCursor *cursor)
+// Release a detached scope. The lexer still owns the backing name spellings.
+void free_parser_scope(NameScope *scope)
+{
+    if (!scope)
+        return;
+    hashmap_free(&scope->names);
+    free(scope);
+}
+
+// Restore the enclosing scope, optionally transferring the old frame intact.
+void parser_pop_scope(ParserCursor *cursor, NameScope **saved)
 {
     if (!cursor->scope)
         unreachable();
     NameScope *scope = cursor->scope;
     cursor->scope = scope->parent;
-    hashmap_free(&scope->names);
-    free(scope);
+    scope->parent = NULL;
+    if (saved)
+        *saved = scope;
+    else
+        free_parser_scope(scope);
 }
 
 // Resolve an identifier in the nearest ordinary namespace. An ordinary
@@ -239,10 +269,11 @@ Node *parse(Token *tokens)
 {
     if (!tokens)
         return NULL;
-    ParserCursor cursor = { .token = tokens };
-    parser_push_scope(&cursor);
+    ParserCursor cursor;
+    init_parser_cursor(&cursor, tokens);
+    parser_push_scope(&cursor, NULL);
     Node *tree = parse_translation_unit(&cursor);
-    parser_pop_scope(&cursor);
+    parser_pop_scope(&cursor, NULL);
     return tree;
 }
 
@@ -306,7 +337,8 @@ static void release(Token *tokens)
 static void test_consumption(void)
 {
     Token *tokens = load_basic();
-    ParserCursor cursor = { .token = tokens };
+    ParserCursor cursor;
+    init_parser_cursor(&cursor, tokens);
 
     check(consume_if(&cursor, TOK_KW_INT) != NULL, "consume_if(int)");
 
@@ -333,8 +365,10 @@ static void test_consumption(void)
 static void test_independent_cursors(void)
 {
     Token *tokens = load_basic();
-    ParserCursor a = { .token = tokens };
-    ParserCursor b = { .token = tokens };
+    ParserCursor a;
+    ParserCursor b;
+    init_parser_cursor(&a, tokens);
+    init_parser_cursor(&b, tokens);
 
     check(consume_if(&a, TOK_KW_INT) != NULL, "cursor a consumes int");
     check(token_is(current_token(&b), TOK_KW_INT),
@@ -359,7 +393,8 @@ static void test_token_type_precedes_spelling(void)
           "identifier keeps its exact lexical kind");
     check(!token_is(&ident, TOK_KW_INT),
           "identifier spelling does not match a keyword");
-    ParserCursor cursor = { .token = &ident };
+    ParserCursor cursor;
+    init_parser_cursor(&cursor, &ident);
     check(!starts_declaration(&cursor),
           "identifier spelling does not start a declaration as a keyword");
 }
@@ -381,7 +416,8 @@ static void test_expected_failures(void)
 {
     int before = error_count();
     Token *tokens = load_basic();
-    ParserCursor cursor = { .token = tokens };
+    ParserCursor cursor;
+    init_parser_cursor(&cursor, tokens);
 
     // A failed expect reports once, returns NULL and leaves the cursor in place.
     check(expect(&cursor, TOK_LBRACE) == NULL, "expect({) fails on int");
@@ -2167,7 +2203,8 @@ static void test_operators(void)
         .size = sizeof(assignment_prefix_src) - 1,
     };
     Token *tokens = tokenize(&assignment_prefix_file);
-    ParserCursor cursor = { .token = tokens };
+    ParserCursor cursor;
+    init_parser_cursor(&cursor, tokens);
     Node *prefix = parse_assignment_expression(&cursor);
     check(is_binary(prefix, BINARY_ADD) &&
               token_is(current_token(&cursor), TOK_ASSIGN),
@@ -2179,7 +2216,7 @@ static void test_operators(void)
     assignment_prefix_file.contents = cast_prefix_src;
     assignment_prefix_file.size = sizeof(cast_prefix_src) - 1;
     tokens = tokenize(&assignment_prefix_file);
-    cursor = (ParserCursor){ .token = tokens };
+    init_parser_cursor(&cursor, tokens);
     prefix = parse_assignment_expression(&cursor);
     check(prefix && prefix->type == ND_CAST &&
               token_is(current_token(&cursor), TOK_ASSIGN),
@@ -2579,6 +2616,37 @@ static void test_declaration_context(void)
     node_free(root);
 }
 
+// Verify typedef visibility after control scopes and before a do condition.
+static void test_control_statement_scopes(void)
+{
+    int before = error_count();
+    Node *root = parse_snippet(
+        "typedef int T; int f(void) {"
+        "if (sizeof(enum { T })) { T; } T after_if;"
+        "while (sizeof(enum { T })) break; T after_while;"
+        "do sizeof(enum { T }); while (sizeof(T)); T after_do;"
+        "for (int T = 0; T; ++T) { T; } T after_for;"
+        "switch (sizeof(enum { T })) default: break; T after_switch;"
+        "return 0; }");
+    Node *declaration = root->u.program.external_declarations;
+    const Node *first = first_statement(declaration ? declaration->next : NULL);
+    check(error_count() == before, "control statements restore the outer typedef");
+    const Node *item = first;
+    static const NodeType g_kinds[] = { ND_IF, ND_WHILE, ND_DO_WHILE, ND_FOR, ND_SWITCH };
+    for (size_t i = 0; i < ARRAY_LEN(g_kinds); ++i) {
+        bool found = item && item->type == g_kinds[i] &&
+                     item->next && item->next->type == ND_DECL;
+        check(found, "typedef after a control statement parses as a declaration");
+        if (!found)
+            break;
+        if (item->type == ND_DO_WHILE)
+            check(item->u.do_while.cond->type == ND_SIZEOF_TYPE,
+                  "do body name cannot change typedef classification in the trailing condition");
+        item = item->next->next;
+    }
+    node_free(root);
+}
+
 static int run_tests(void)
 {
     test_consumption();
@@ -2612,6 +2680,7 @@ static int run_tests(void)
     test_array_declarators();
     test_initializer_lists();
     test_control_flow();
+    test_control_statement_scopes();
     test_functions();
     test_error_count();
     test_error_recovery_reports_all();

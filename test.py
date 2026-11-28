@@ -2,10 +2,9 @@
 #
 # Compare wing-gcc diagnostics against gcc on the same sources.
 #
-# Both compilers run their full front end (preprocess/lex/parse) on the same
-# sources. Diagnostics are split into blocks (message line + source line + caret
-# line + suggestion lines) and matched one-to-one: a verdict only counts when
-# both sides have the same blocks.
+# The default wing-gcc driver runs lexical, syntactic and semantic analysis.
+# GCC checks the same sources in C11 mode. Diagnostics are matched one-to-one
+# as complete blocks (message, source, caret and suggestion lines).
 #
 #   match   : both reject and the block sets are byte-identical
 #   near    : both reject, every wing-gcc block corresponds to a gcc one after
@@ -15,7 +14,7 @@
 #             the reasons (body-missing / body-extra / body-differs /
 #             no-counterpart / missing-diagnostic)
 #   missed  : gcc rejects, wing-gcc accepts (expected until more phases land)
-#   FALSE+  : gcc accepts, but wing-gcc rejects (parser coverage debt)
+#   FALSE+  : gcc accepts and wing-gcc rejects (front-end coverage debt)
 #
 # LC_ALL=C keeps gcc's quoting (ASCII ' ') consistent with wing-gcc's.
 # The oracle is N1570: gcc runs -std=c11 -pedantic-errors and explicitly
@@ -356,7 +355,7 @@ def main(argv):
           f"missed={counts['missed']}  false-positives={counts['false_pos']}")
     if counts["differ"]:
         print("differ reasons: " + "  ".join(f"{name}={reasons[name]}" for name in reason_names))
-    print("(false-positives = parser coverage debt; 'missed' shrinks as language support grows)")
+    print("(false-positives track front-end coverage debt. Missed cases shrink as coverage grows.)")
     return 0 if counts["false_pos"] == 0 else 1
 
 

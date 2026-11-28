@@ -849,7 +849,8 @@ void validate_declaration_constraints(
     if ((specs->ast->storage & STORAGE_THREAD_LOCAL) && is_function)
         error_at(name_span ? name_span : &specs->thread_local_tok->span,
                  "function declared '_Thread_local'");
-    if (specs->ast->function_specifiers && !is_function)
+    if (specs->ast->function_specifiers && !is_function &&
+        specs->ast->type->kind != TYPE_SPECIFIER_TYPEDEF_NAME)
         error_at(name_span ? name_span : &specs->function_specifier_tok->span,
                  "function specifier applied to non-function declaration");
     if (specs->ast->alignments &&

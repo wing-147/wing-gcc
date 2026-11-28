@@ -43,12 +43,16 @@ parser_test: mk_output_dir
 	src/util/diagnostic.c src/util/source.c src/util/common.c src/util/hashmap.c \
 	-o $(OUTPUT)$@
 
-check: wing-gcc lexer_test diagnostic_test source_test hashmap_test parser_test
+sema_test: mk_output_dir
+	$(CC) $(CFLAGS) -DTEST_SEMA $(filter-out src/main.c,$(SRC)) -o $(OUTPUT)$@
+
+check: wing-gcc lexer_test diagnostic_test source_test hashmap_test parser_test sema_test
 	./bin/source_test
 	./bin/diagnostic_test
 	./bin/hashmap_test
 	./bin/lexer_test
 	./bin/parser_test
+	./bin/sema_test
 	./bin/lexer_test tests/tests/basic.c > /dev/null
 	./bin/wing-gcc tests/tests/basic.c > /dev/null
 	@echo "all checks passed"

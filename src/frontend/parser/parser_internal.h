@@ -61,13 +61,14 @@ typedef struct {
     const Declarator *layer;
 } DeclaratorConstraintError;
 
+typedef struct NameScope NameScope;
+
 typedef struct {
     const Token *name_tok;
     Declarator *prefix;
     Declarator *shape;
+    NameScope **definition_parameters;
 } ParsedDeclarator;
-
-typedef struct NameScope NameScope;
 
 // Parser-local state travels with the explicit cursor. Grammar functions may
 // advance `token`; only declaration/scope boundaries may mutate `scope`.
@@ -95,6 +96,7 @@ typedef struct {
     PARSER_ALTERNATIVE_FIELDS(ParserStartsFn, NodeOutAlternativeParseFn);
 } NodeOutAlternative;
 
+void init_parser_cursor(ParserCursor *cursor, Token *tokens);
 Token *current_token(const ParserCursor *cursor);
 Token *peek_token(const ParserCursor *cursor, size_t distance);
 Token *consume(ParserCursor *cursor);
@@ -105,8 +107,9 @@ Token *expect(ParserCursor *cursor, TokenKind kind);
 bool skip_balanced_group(ParserCursor *cursor, TokenKind open,
                          TokenKind close);
 Token *expect_identifier(ParserCursor *cursor);
-void parser_push_scope(ParserCursor *cursor);
-void parser_pop_scope(ParserCursor *cursor);
+void parser_push_scope(ParserCursor *cursor, NameScope **saved);
+void parser_pop_scope(ParserCursor *cursor, NameScope **saved);
+void free_parser_scope(NameScope *scope);
 bool parser_name_is_typedef(const ParserCursor *cursor, const Token *name);
 void parser_declare_name(ParserCursor *cursor, const StringView *name,
                          bool is_typedef);
@@ -246,7 +249,7 @@ Node *parse_constant_expression(ParserCursor *cursor);
 bool starts_assignment_expression(const ParserCursor *cursor);
 Node *parse_initializer(ParserCursor *cursor);
 bool parse_initializer_list(ParserCursor *cursor, Node **out);
-Node *parse_statement(ParserCursor *cursor);
+// Parse the compound-statement production in the caller's active block scope.
 Node *parse_compound_statement(ParserCursor *cursor);
 bool starts_block_item(const ParserCursor *cursor);
 bool parse_declaration(ParserCursor *cursor, DeclarationContext context,

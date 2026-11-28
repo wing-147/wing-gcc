@@ -6,9 +6,8 @@
 
 ## 项目简介
 
-`wing-gcc` 是一个自包含的 C 编译器，把 C 语言的一个实用子集翻译为机器码。前端按阶段逐步
-搭建——源码管理、词法分析、语法分析与 AST 构建——后续阶段会把 AST 降低到后端。
-目标是让每一层都显式、可理解：不使用 parser 生成器，不依赖外部编译器框架，只用 C和操作系统本身。
+`wing-gcc` 当前分析 C11 的一个实用子集。前端负责源码加载、词法分析、语法分析、AST 构建和语义分析。
+规划中的后端会消费 AST 和语义结果，生成 x86-64 机器码。各层直接用 C 实现，无需语法分析器生成器或外部编译器框架。
 
 ## 目标
 
@@ -24,11 +23,12 @@
 | ------------ | ------------------------------------------------------------- |
 | 源码管理     | ✅ `source.c` / `source.h`                                    |
 | 词法分析器   | ✅ 数字、字符串、字符、标识符、关键字、标点、注释              |
-| 抽象语法树   | 🚧 节点类型与接口已定义                                        |
-| 语法分析器   | 🚧 表达式、语句、函数与递归声明                                |
+| 抽象语法树   | ✅ 已支持语法子集的节点和所有权                               |
+| 语法分析器   | ✅ 已支持语法子集的递归下降分析                               |
+| 语义分析器   | ✅ 类型、绑定、转换、初始化与控制流                           |
 | 代码生成     | ⬜ 计划中                                                      |
 
-词法分析器已完成：它把源码缓冲区转换为 token 链表，支持数字、字符串与字符字面量
+词法分析器把源码缓冲区转换为 token 链表，支持数字、字符串与字符字面量
 （含 `u8`/`u`/`U`/`L` 前缀）、标识符与关键字、标点符号，以及行注释和块注释。边界扫描、
 位置附加、字面量解码和翻译阶段 6 的相邻字符串拼接是分离的内部阶段，公共 lexer 只返回完整 token；词法错误以 GCC 风格报告并继续分析。AST 与语法分析器已覆盖
 表达式、语句、函数、递归声明符、结构/联合/枚举说明符、带作用域的 typedef-name 判定、
@@ -36,12 +36,18 @@
 错误恢复位于语句与外部声明边界。暂不支持隐式返回类型（C89）
 与嵌套函数定义。
 
+语义分析检查类型、声明、链接、函数调用、控制流，以及标量、固定或推导边界的数组、结构体和联合体的初始化。
+它也处理枚举、复合字面量、`_Static_assert`、`_Atomic`、`_Alignas`、`_Alignof`、`_Generic`、
+`_Thread_local`、`inline` 和 `_Noreturn`。变长数组、可变修改类型和带非空标识符列表的
+K&R 风格函数定义目前会触发诊断。
+预处理尚待实现，`#include` 当前无法把头文件中的声明引入前端。
+
 ## 架构
 
 ```
         +-----------+     +---------+     +----------+     +-----+
-source  |  source.c | --> |  lexer/ | --> | parser/  | --> | AST | --> backend
-buffer  |           |     | tokenize|     |  parse   |     |     |     (planned)
+source  |  source.c | --> |  lexer/ | --> | parser/  | --> | AST | --> sema/ --> backend
+buffer  |           |     | tokenize|     |  parse   |     |     |              (planned)
         +-----------+     +---------+     +----------+     +-----+
                               |                |
                               v                v
@@ -54,6 +60,15 @@ buffer  |           |     | tokenize|     |  parse   |     |     |     (planned)
 为 GCC 风格，基于共享的 `DiagKind` + `SourceSpan` 核心，`fatal()` 用于内部错误并终止。一个
 开放寻址的 `HashMap`（`hashmap.c`）支撑前端名字状态，显示宽度规则与源码位置一起放在
 `source.h`，保证 token 列与诊断 caret 始终一致。
+
+### 语义分析
+
+词法与语法分析成功后，默认驱动把 AST 根节点传给 `sema_analyze()`，并在分析成功时取得结果的所有权。
+只读查询以 AST 节点为键，提供声明快照、表达式类型和值类别、有序的隐式转换、初始化步骤和控制流目标。
+[公共语义接口](include/frontend/sema.h)
+
+结果借用 AST 和源码。调用者先用 `sema_free()` 释放结果，再释放 AST 和源码。
+规划中的后端将使用 AST 和这些语义结果构建 IR 与控制流。
 
 ## 目录结构
 
@@ -69,6 +84,7 @@ wing-gcc/
 │   │   ├── ast.h         # AST 节点定义
 │   │   ├── lexer.h       # 词法分析器接口
 │   │   ├── parser.h      # 语法分析器接口
+│   │   ├── sema.h        # 语义分析和结果查询接口
 │   │   └── token.h       # Token 定义
 │   └── backend/          # 预留：出现第一份后端文件时创建
 ├── src/                  # 编译器实现，与 include/ 镜像
@@ -85,14 +101,27 @@ wing-gcc/
 │   │   │   ├── literal.c # 字面量校验与解码
 │   │   │   ├── scan.c    # token 边界扫描
 │   │   │   └── token.c   # 精确终结符清单与 token 生命周期
-│   │   └── parser/       # 递归下降 parser 子系统
-│   │       ├── ast.c
+│   │   ├── parser/       # 递归下降 parser 子系统
+│   │   │   ├── ast.c
+│   │   │   ├── declaration.c
+│   │   │   ├── diagnostic.c
+│   │   │   ├── expression.c
+│   │   │   ├── parser.c
+│   │   │   ├── parser_internal.h
+│   │   │   └── statement.c
+│   │   └── sema/         # 语义分析与结果存储
+│   │       ├── constant.c
+│   │       ├── conversion.c
 │   │       ├── declaration.c
-│   │       ├── diagnostic.c
 │   │       ├── expression.c
-│   │       ├── parser.c
-│   │       ├── parser_internal.h
-│   │       └── statement.c
+│   │       ├── initializer.c
+│   │       ├── layout.c
+│   │       ├── result.c
+│   │       ├── scope.c
+│   │       ├── sema.c
+│   │       ├── sema_internal.h
+│   │       ├── statement.c
+│   │       └── type.c
 │   └── backend/          # 预留：出现第一份后端文件时创建
 ├── tests/            # 测试用例
 │   ├── tests/        # 内部用例：valid/ 应接受，error_lex/ 应拒绝，
@@ -117,30 +146,31 @@ make check          # 构建并运行所有测试驱动
 make clean          # 删除 bin/
 ```
 
-单个测试驱动：`make lexer_test diagnostic_test source_test hashmap_test parser_test`。
+单个测试驱动：`make lexer_test diagnostic_test source_test hashmap_test parser_test sema_test`。
 
 ### 测试
 
 `make check` 会构建 `wing-gcc`，运行断言式单元测试（`source_test`、`diagnostic_test`、
-`hashmap_test`）、词法测试（token 分类、显示行列、整条 token 流比对）以及 parser 测试
-（cursor/作用域原语、AST 构造函数、声明、表达式优先级、语句/外部声明级错误恢复）。
+`hashmap_test`）、词法测试（token 分类、显示行列、整条 token 流比对）、parser 测试
+（cursor/作用域原语、AST 构造函数、声明、表达式优先级及错误恢复）和语义测试
+（绑定、转换、跳转目标、初始化位置和诊断）。
 
-`./test.py` 把 wing-gcc 与真实 `gcc` 跑在同一批源码上，逐条对比**完整诊断块**
-（`文件:行:列: error: 消息` 行、引用的源码行、caret 行）。每条 wing-gcc 诊断都必须在
-双方找到一一对应：`match`（逐字节全同且一一对应）、`near`（位置相同或归一化后消息相同，
-且 gcc 的块全部有对应）、`differ`（有块无对应或仅部分一致）、`missed`（gcc 报错、
+`./test.py` 在同一批源码上运行 wing-gcc 与 `gcc -std=c11 -pedantic-errors`，比较完整诊断块，
+包括位置、消息、引用的源码行和 caret 行。结果分为 `match`（逐字节全同且一一对应）、
+`near`（位置相同或归一化后消息相同，且 GCC 的块全部有对应）、
+`differ`（有块无对应或仅部分一致）、`missed`（gcc 报错、
 wing-gcc 接受）、`FALSE+`（gcc 接受、wing-gcc 报错）。所有用例一律走完整前端，没有
-词法专用模式。ch1–4 的 `false-positives` 必须为 0；ch5+ 与词法 `valid/` 的失败是 parser
-覆盖度债务；不存在豁免名单，gcc 接受而 wing-gcc 拒绝一律计入 `FALSE+` 并使本次运行失败。
+词法专用模式。ch1–4 的 `false-positives` 必须为 0，ch5 的 `missed` 和 `false-positives` 均须为 0。
+任何 GCC 接受而 wing-gcc 拒绝的用例都计入 `FALSE+` 并使本次运行失败，包含因头文件未展开而缺少声明的用例。
 `-my` 跑 `tests/tests`，`-third-party <chapter> [dir]` 跑内置套件，
 `-v` 打印双方完整输出。
 
 ## 使用
 
-驱动运行前端：先词法分析再语法分析，并报告诊断（成功时静默）；任何错误都会返回非零状态。
+驱动依次运行词法、语法和语义分析，报告错误时返回非零状态。
 
 ```sh
-./bin/wing-gcc tests/tests/basic.c     # 词法 + 语法分析；成功时静默
+./bin/wing-gcc tests/tests/basic.c     # 运行完整前端
 ./bin/lexer_test tests/tests/basic.c   # 专用的 token 打印驱动
 ```
 
@@ -163,8 +193,9 @@ EOF
 
 - [x] 源码管理
 - [x] 词法分析器
-- [ ] 语法分析与 AST 构建
-- [ ] 语义分析
+- [x] 当前子集的语法分析与 AST 构建
+- [x] 当前子集的语义分析
+- [ ] 预处理与延期的 C11 特性
 - [ ] 中间表示与优化
 - [ ] x86-64 后端代码生成
 - [ ] 自举探索

@@ -494,6 +494,7 @@ Declarator *new_array_declarator(Declarator *inner, Node *size,
     SourceSpan span = inner ? source_span_join(&inner->span, &close->span)
                             : source_span_join(&open->span, &close->span);
     Declarator *decl = new_declarator(DECLARATOR_ARRAY, inner, span);
+    decl->suffix_span = source_span_join(&open->span, &close->span);
     decl->u.array.size = size;
     decl->u.array.qualifiers = qualifiers;
     decl->u.array.form = form;
@@ -510,6 +511,7 @@ Declarator *new_function_declarator(Declarator *inner,
     SourceSpan span = inner ? source_span_join(&inner->span, &close->span)
                             : source_span_join(&open->span, &close->span);
     Declarator *decl = new_declarator(DECLARATOR_FUNCTION, inner, span);
+    decl->suffix_span = source_span_join(&open->span, &close->span);
     decl->u.function.form = form;
     switch (form) {
     case FUNCTION_PARAMS_PROTOTYPE:

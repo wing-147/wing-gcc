@@ -48,13 +48,12 @@ typedef struct {
 typedef struct {
     TypeSpecifier *type;
     unsigned qualifiers;
+    AlignmentSpecifier *alignments;
     const Token *start;
     const Token *end;
 } ParsedSpecifierQualifierList;
 
 typedef bool (*SpecifierParseFn)(ParserCursor *cursor, TypeSpecifiers *out);
-typedef bool (*SpecifierStartsFn)(const ParserCursor *cursor,
-                                  const TypeSpecifiers *state);
 typedef bool (*DeclarationSpecifierStartsFn)(
     const ParserCursor *cursor, const DeclarationSpecifiersState *state);
 typedef bool (*DeclarationSpecifierParseFn)(
@@ -68,10 +67,6 @@ typedef bool (*DeclarationParseFn)(ParserCursor *cursor,
 typedef struct {
     PARSER_ALTERNATIVE_FIELDS(ParserStartsFn, SpecifierParseFn);
 } SpecifierAlternative;
-
-typedef struct {
-    PARSER_ALTERNATIVE_FIELDS(SpecifierStartsFn, SpecifierParseFn);
-} StatefulSpecifierAlternative;
 
 typedef struct {
     PARSER_ALTERNATIVE_FIELDS(DeclarationSpecifierStartsFn,
@@ -134,7 +129,8 @@ typedef struct {
     FunctionParameterForm function_form;
 } DeclaratorSummary;
 
-static bool parse_declarator(ParserCursor *cursor, ParsedDeclarator *out);
+static bool parse_declarator(ParserCursor *cursor, ParsedDeclarator *out,
+                             NameScope **definition_parameters);
 static bool parse_abstract_declarator(ParserCursor *cursor,
                                       ParsedDeclarator *out);
 static bool parse_direct_abstract_declarator(ParserCursor *cursor,
@@ -798,7 +794,7 @@ static bool starts_declaration_storage_class(
 }
 
 // Select a type child while preserving typedef-name termination after a type.
-static bool starts_declaration_type_specifier(
+static bool starts_type_specifier_in_state(
     const ParserCursor *cursor, const DeclarationSpecifiersState *state)
 {
     return starts_type_specifier(cursor) &&
@@ -806,11 +802,9 @@ static bool starts_declaration_type_specifier(
              type_specifiers_have_type(&state->types));
 }
 
-// Branch of (6.7) declaration-specifiers:
-//     type-specifier declaration-specifiersopt
-// Owned only by parse_declaration_specifiers(); this adapter advances the
-// aggregate endpoint after its child completes.
-static bool parse_declaration_type_specifier(
+// Non-grammar adapter shared by the two specifier lists. Retain the
+// whole list's endpoint after the type-specifier child succeeds.
+static bool parse_type_specifier_in_state(
     ParserCursor *cursor, DeclarationSpecifiersState *state)
 {
     if (!parse_type_specifier(cursor, &state->types))
@@ -819,19 +813,17 @@ static bool parse_declaration_type_specifier(
     return true;
 }
 
-// Select a qualifier child for the current declaration-specifiers state.
-static bool starts_declaration_type_qualifier(
+// Select a qualifier child in either specifier list.
+static bool starts_type_qualifier_in_state(
     const ParserCursor *cursor, const DeclarationSpecifiersState *state)
 {
     (void)state;
     return starts_type_qualifier(cursor);
 }
 
-// Branch of (6.7) declaration-specifiers:
-//     type-qualifier declaration-specifiersopt
-// Owned only by parse_declaration_specifiers(); this adapter advances the
-// aggregate endpoint after its child completes.
-static bool parse_declaration_type_qualifier(
+// Non-grammar adapter shared by the two specifier lists. Retain the
+// whole list's endpoint after the type-qualifier child succeeds.
+static bool parse_type_qualifier_in_state(
     ParserCursor *cursor, DeclarationSpecifiersState *state)
 {
     if (!parse_type_qualifier(cursor, &state->types))
@@ -864,10 +856,8 @@ static const DeclarationSpecifierAlternative
     g_declaration_specifier_alternatives[] = {
         { starts_declaration_storage_class,
           parse_storage_class_specifier },
-        { starts_declaration_type_specifier,
-          parse_declaration_type_specifier },
-        { starts_declaration_type_qualifier,
-          parse_declaration_type_qualifier },
+        { starts_type_specifier_in_state, parse_type_specifier_in_state },
+        { starts_type_qualifier_in_state, parse_type_qualifier_in_state },
         { starts_declaration_function_specifier,
           parse_function_specifier },
         { starts_declaration_alignment_specifier,
@@ -983,7 +973,7 @@ static bool starts_pointer(const ParserCursor *cursor)
 static bool parse_parameter_named_declarator(ParserCursor *cursor,
                                              ParsedDeclarator *out)
 {
-    if (!parse_declarator(cursor, out))
+    if (!parse_declarator(cursor, out, NULL))
         return false;
     parser_declare_name(cursor,
                         out->name_tok ? &out->name_tok->span.text : NULL,
@@ -1216,7 +1206,7 @@ static bool parse_direct_declarator_parenthesized(ParserCursor *cursor,
     Token *open = consume(cursor);
 
     ParsedDeclarator nested;
-    if (!parse_declarator(cursor, &nested))
+    if (!parse_declarator(cursor, &nested, out->definition_parameters))
         return false;
     Token *close = expect(cursor, TOK_RPAREN);
     if (!close) {
@@ -1370,7 +1360,7 @@ static bool parse_direct_declarator_function_suffix(ParserCursor *cursor,
     }
 
     ParsedParameterClause clause = {0};
-    parser_push_scope(cursor);
+    parser_push_scope(cursor, NULL);
     const ParameterClauseAlternative *alternative = NULL;
     for (size_t i = 0; i < ARRAY_LEN(g_parameter_clause_alternatives); i++) {
         if (g_parameter_clause_alternatives[i].starts(cursor)) {
@@ -1380,20 +1370,21 @@ static bool parse_direct_declarator_function_suffix(ParserCursor *cursor,
     }
     if (!alternative) {
         handle_parser_error_parameter_list(current_token(cursor));
-        parser_pop_scope(cursor);
+        parser_pop_scope(cursor, NULL);
         return false;
     }
     if (!alternative->parse(cursor, &clause)) {
-        parser_pop_scope(cursor);
+        parser_pop_scope(cursor, NULL);
         return false;
     }
     close = expect(cursor, TOK_RPAREN);
     if (!close) {
         node_free(clause.parameters);
-        parser_pop_scope(cursor);
+        parser_pop_scope(cursor, NULL);
         return false;
     }
-    parser_pop_scope(cursor);
+    NameScope **saved = out->shape->kind == DECLARATOR_IDENT ? out->definition_parameters : NULL;
+    parser_pop_scope(cursor, saved);
     out->shape = new_function_declarator(
         out->shape, clause.parameters, clause.form, clause.variadic, open,
         close);
@@ -1489,77 +1480,72 @@ static bool parse_type_qualifier_list(ParserCursor *cursor, TypeSpecifiers *out)
     return true;
 }
 
-// (6.7.2.1) specifier-qualifier-list:
-//     type-specifier specifier-qualifier-listopt
-//     type-qualifier specifier-qualifier-listopt
-// Select a type-specifier unless a completed type makes a typedef-name the
-// following declarator identifier.
-static bool starts_specifier_qualifier_type(
-    const ParserCursor *cursor, const TypeSpecifiers *state)
+// ---------------------------------------------------------------------------
+// specifier-qualifier-list private region
+// ---------------------------------------------------------------------------
+
+static const struct {
+    DeclarationSpecifierAlternative alternative;
+    bool member_only;
+} g_specifier_qualifier_alternatives[] = {
+    { { starts_type_specifier_in_state, parse_type_specifier_in_state }, false },
+    { { starts_type_qualifier_in_state, parse_type_qualifier_in_state }, false },
+    { { starts_declaration_alignment_specifier, parse_alignment_specifier }, true },
+};
+
+// Select a direct specifier alternative through the shared inventory.
+static const DeclarationSpecifierAlternative *lookup_specifier_qualifier(
+    const ParserCursor *cursor, const DeclarationSpecifiersState *state, bool member)
 {
-    return starts_type_specifier(cursor) &&
-           !(starts_typedef_name(cursor) && type_specifiers_have_type(state));
+    for (size_t i = 0; i < ARRAY_LEN(g_specifier_qualifier_alternatives); ++i) {
+        const DeclarationSpecifierAlternative *alternative =
+            &g_specifier_qualifier_alternatives[i].alternative;
+        if ((member || !g_specifier_qualifier_alternatives[i].member_only) &&
+            alternative->starts(cursor, state))
+            return alternative;
+    }
+    return NULL;
 }
 
-// Select a type-qualifier without consuming parser state.
-static bool starts_specifier_qualifier_qualifier(
-    const ParserCursor *cursor, const TypeSpecifiers *state)
-{
-    (void)state;
-    return starts_type_qualifier(cursor);
-}
-
-static const StatefulSpecifierAlternative
-    g_specifier_qualifier_alternatives[] = {
-        { starts_specifier_qualifier_type, parse_type_specifier },
-        { starts_specifier_qualifier_qualifier, parse_type_qualifier },
-    };
-
-// Select specifier-qualifier-list through its sole alternative inventory.
+// Select the type-name variant of specifier-qualifier-list.
 static bool starts_specifier_qualifier_list(const ParserCursor *cursor)
 {
-    TypeSpecifiers state = {0};
-    for (size_t i = 0;
-         i < ARRAY_LEN(g_specifier_qualifier_alternatives); i++) {
-        if (g_specifier_qualifier_alternatives[i].starts(cursor, &state))
-            return true;
-    }
-    return false;
+    DeclarationSpecifiersState state = {0};
+    return lookup_specifier_qualifier(cursor, &state, false) != NULL;
+}
+
+// Select the structure-member variant, including alignment specifiers.
+static bool starts_member_specifier_qualifier_list(const ParserCursor *cursor)
+{
+    DeclarationSpecifiersState state = {0};
+    return lookup_specifier_qualifier(cursor, &state, true) != NULL;
 }
 
 // (6.7.2.1) specifier-qualifier-list:
 //     type-specifier specifier-qualifier-listopt
 //     type-qualifier specifier-qualifier-listopt
-// This production owns type-combination resolution because both type-name and
-// struct-declaration require the same completed child.
+//     alignment-specifier specifier-qualifier-listopt (member only, DR 444)
+// Resolve the completed list and transfer its owned specifiers.
 static bool parse_specifier_qualifier_list(
-    ParserCursor *cursor, ParsedSpecifierQualifierList *out)
+    ParserCursor *cursor, ParsedSpecifierQualifierList *out, bool member)
 {
     *out = (ParsedSpecifierQualifierList){ .start = current_token(cursor) };
-    TypeSpecifiers state = {0};
-    for (;;) {
-        const StatefulSpecifierAlternative *alternative = NULL;
-        for (size_t i = 0;
-             i < ARRAY_LEN(g_specifier_qualifier_alternatives); i++) {
-            if (g_specifier_qualifier_alternatives[i].starts(cursor, &state)) {
-                alternative = &g_specifier_qualifier_alternatives[i];
-                break;
-            }
-        }
-        if (!alternative)
-            break;
+    DeclarationSpecifiersState state = {0};
+    const DeclarationSpecifierAlternative *alternative;
+    while ((alternative = lookup_specifier_qualifier(cursor, &state, member))) {
         if (!alternative->parse(cursor, &state)) {
-            type_specifier_free(state.other);
+            discard_declaration_specifiers_state(&state);
             return false;
         }
     }
     TypeSpecifierError error;
-    if (!resolve_type_specifiers(&state, out->start, &out->type, &error)) {
+    if (!resolve_type_specifiers(&state.types, out->start, &out->type, &error)) {
         handle_parser_error_type_specifier(&error);
-        type_specifier_free(state.other);
+        discard_declaration_specifiers_state(&state);
         return false;
     }
-    out->qualifiers = state.qualifiers;
+    out->qualifiers = state.types.qualifiers;
+    out->alignments = state.alignments;
     out->end = state.last ? state.last : out->start;
     return true;
 }
@@ -1570,7 +1556,7 @@ bool parse_type_name(ParserCursor *cursor, TypeName **out)
 {
     *out = NULL;
     ParsedSpecifierQualifierList specs;
-    if (!parse_specifier_qualifier_list(cursor, &specs)) {
+    if (!parse_specifier_qualifier_list(cursor, &specs, false)) {
         return false;
     }
 
@@ -1716,23 +1702,23 @@ static bool parse_direct_abstract_declarator_function_suffix(
 
     Node *params = NULL;
     bool variadic = false;
-    parser_push_scope(cursor);
+    parser_push_scope(cursor, NULL);
     if (!starts_parameter_type_list(cursor)) {
         handle_parser_error_parameter_list(current_token(cursor));
-        parser_pop_scope(cursor);
+        parser_pop_scope(cursor, NULL);
         return false;
     }
     if (!parse_parameter_type_list(cursor, &params, &variadic)) {
-        parser_pop_scope(cursor);
+        parser_pop_scope(cursor, NULL);
         return false;
     }
     close = expect(cursor, TOK_RPAREN);
     if (!close) {
         node_free(params);
-        parser_pop_scope(cursor);
+        parser_pop_scope(cursor, NULL);
         return false;
     }
-    parser_pop_scope(cursor);
+    parser_pop_scope(cursor, NULL);
     out->shape = new_function_declarator(out->shape, params,
                                          FUNCTION_PARAMS_PROTOTYPE,
                                          variadic, open, close);
@@ -1838,9 +1824,10 @@ static bool parse_direct_abstract_declarator(ParserCursor *cursor,
 //     pointeropt direct-declarator
 // Pointer prefixes are parsed separately and attached after the required
 // direct-declarator so parentheses preserve C's binding rules.
-static bool parse_declarator(ParserCursor *cursor, ParsedDeclarator *out)
+static bool parse_declarator(ParserCursor *cursor, ParsedDeclarator *out,
+                             NameScope **definition_parameters)
 {
-    *out = (ParsedDeclarator){0};
+    *out = (ParsedDeclarator){ .definition_parameters = definition_parameters };
     if (starts_pointer(cursor) && !parse_pointer(cursor, out))
         return false;
     if (!parse_direct_declarator(cursor, out)) {
@@ -2104,7 +2091,7 @@ static bool parse_struct_static_assertion(ParserCursor *cursor, Node **out)
 
 static const NodeOutAlternative g_struct_declaration_alternatives[] = {
     { starts_static_assert_declaration, parse_struct_static_assertion },
-    { starts_specifier_qualifier_list, parse_struct_member_declaration },
+    { starts_member_specifier_qualifier_list, parse_struct_member_declaration },
 };
 
 static bool starts_struct_declaration(const ParserCursor *cursor)
@@ -2150,13 +2137,14 @@ static bool parse_struct_member_declaration(ParserCursor *cursor, Node **out)
 {
     *out = NULL;
     ParsedSpecifierQualifierList parsed;
-    if (!parse_specifier_qualifier_list(cursor, &parsed)) {
+    if (!parse_specifier_qualifier_list(cursor, &parsed, true)) {
         return false;
     }
     DeclarationSpecifiers *specifiers = new_declaration_specifiers(
-        parsed.type, parsed.qualifiers, STORAGE_NONE, 0, NULL, parsed.start,
+        parsed.type, parsed.qualifiers, STORAGE_NONE, 0, parsed.alignments, parsed.start,
         parsed.end);
     parsed.type = NULL;
+    parsed.alignments = NULL;
 
     Node *declarators = NULL;
     if (starts_struct_declarator(cursor)) {
@@ -2229,7 +2217,7 @@ static bool parse_struct_declarator(ParserCursor *cursor, Node **out)
     *out = NULL;
     ParsedDeclarator parsed = {0};
     if (!token_is(current_token(cursor), TOK_COLON)) {
-        if (!parse_declarator(cursor, &parsed))
+        if (!parse_declarator(cursor, &parsed, NULL))
             return false;
         validate_declarator_constraints(&parsed, DECLARATOR_ORDINARY);
     }
@@ -2294,7 +2282,6 @@ static bool parse_enumerator(ParserCursor *cursor, Node **out)
 {
     *out = NULL;
     Token *name = consume(cursor);
-    parser_declare_name(cursor, &name->span.text, false);
     Node *value = NULL;
     if (consume_if(cursor, TOK_ASSIGN)) {
         value = parse_constant_expression(cursor);
@@ -2302,6 +2289,7 @@ static bool parse_enumerator(ParserCursor *cursor, Node **out)
             return false;
     }
     *out = new_enumerator(name, value);
+    parser_declare_name(cursor, &name->span.text, false);
     return true;
 }
 
@@ -2390,7 +2378,7 @@ static bool starts_init_declarator_list(const ParserCursor *cursor)
 static Node *parse_init_declarator(ParserCursor *cursor, bool is_typedef)
 {
     ParsedInitDeclarator parsed = {0};
-    if (!parse_declarator(cursor, &parsed.declarator))
+    if (!parse_declarator(cursor, &parsed.declarator, NULL))
         return NULL;
     parser_declare_name(cursor, parsed.declarator.name_tok
                                     ? &parsed.declarator.name_tok->span.text
@@ -2731,29 +2719,15 @@ static bool starts_function_definition(const ParserCursor *cursor)
     return starts_declaration_list(&lookahead);
 }
 
-// Install function parameter spellings in the function-definition scope.
-// Prototype parsing used a temporary scope that ended at its closing ')'; the
-// completed declarator is the sole source of bindings that extend into body.
+// Register old-style identifiers after entering the function body scope.
 static void declare_function_parameter_names(ParserCursor *cursor,
                                              const Declarator *function)
 {
-    if (function->u.function.form == FUNCTION_PARAMS_PROTOTYPE) {
-        for (const Node *param =
-                 function->u.function.clause.prototype.parameters;
-             param; param = param->next) {
-            const SourceSpan *span =
-                declarator_name_span(param->u.parameter.declarator);
-            if (!span)
-                continue;
-            parser_declare_name(cursor, &span->text, false);
-        }
-    } else {
-        for (const Node *identifier =
-                 function->u.function.clause.old_style.identifiers;
-             identifier; identifier = identifier->next) {
-            parser_declare_name(cursor, &identifier->span.text, false);
-        }
-    }
+    if (function->u.function.form != FUNCTION_PARAMS_IDENTIFIER_LIST)
+        return;
+    for (const Node *identifier = function->u.function.clause.old_style.identifiers;
+         identifier; identifier = identifier->next)
+        parser_declare_name(cursor, &identifier->span.text, false);
 }
 
 // (6.9.1) function-definition:
@@ -2767,7 +2741,9 @@ static bool parse_function_definition(ParserCursor *cursor, Node **out)
     if (!parse_declaration_specifiers(cursor, &specs))
         return false;
     ParsedDeclarator decl = {0};
-    if (!parse_declarator(cursor, &decl)) {
+    NameScope *parameters = NULL;
+    if (!parse_declarator(cursor, &decl, &parameters)) {
+        free_parser_scope(parameters);
         declaration_specifiers_free(specs.ast);
         return false;
     }
@@ -2782,7 +2758,7 @@ static bool parse_function_definition(ParserCursor *cursor, Node **out)
     parser_declare_name(cursor,
                         decl.name_tok ? &decl.name_tok->span.text : NULL,
                         false);
-    parser_push_scope(cursor);
+    parser_push_scope(cursor, &parameters);
     declare_function_parameter_names(cursor, function_decl);
 
     Node *declarations = NULL;
@@ -2790,7 +2766,7 @@ static bool parse_function_definition(ParserCursor *cursor, Node **out)
         if (!parse_declaration_list(cursor, &declarations)) {
             discard_parsed_declarator(&decl);
             declaration_specifiers_free(specs.ast);
-            parser_pop_scope(cursor);
+            parser_pop_scope(cursor, NULL);
             return false;
         }
         validate_function_definition_declarations(function_decl, declarations);
@@ -2801,10 +2777,10 @@ static bool parse_function_definition(ParserCursor *cursor, Node **out)
         discard_parsed_declarator(&decl);
         declaration_specifiers_free(specs.ast);
         node_free(declarations);
-        parser_pop_scope(cursor);
+        parser_pop_scope(cursor, NULL);
         return false;
     }
-    parser_pop_scope(cursor);
+    parser_pop_scope(cursor, NULL);
     *out = new_function(specs.ast, decl.shape, declarations, body);
     specs.ast = NULL;
     decl.shape = NULL;
@@ -2866,7 +2842,8 @@ bool parser_test_initializer_list_leaves_trailing_comma(void)
         .size = sizeof(source) - 1,
     };
     Token *tokens = tokenize(&file);
-    ParserCursor cursor = { .token = tokens };
+    ParserCursor cursor;
+    init_parser_cursor(&cursor, tokens);
     Node *items = NULL;
     bool ok = parse_initializer_list(&cursor, &items) &&
               token_is(current_token(&cursor), TOK_COMMA);

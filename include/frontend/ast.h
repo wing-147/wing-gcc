@@ -249,6 +249,7 @@ struct DeclarationSpecifiers {
 struct Declarator {
     DeclaratorKind kind;
     SourceSpan span;
+    SourceSpan suffix_span; // Delimiters for array and function layers.
     Declarator *inner;
     union {
         struct {

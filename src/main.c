@@ -1,9 +1,9 @@
-// The driver runs the front end: load -> tokenize -> parse, then releases the
-// AST; later phases plug into the same pipeline. The exit status is decided by
-// error_count(), not by the driver.
+// The driver runs source loading, tokenization, parsing and semantic analysis.
+// The exit status follows error_count().
 
 #include "frontend/lexer.h"
 #include "frontend/parser.h"
+#include "frontend/sema.h"
 #include "util/diagnostic.h"
 #include "util/source.h"
 
@@ -26,8 +26,12 @@ int main(int argc, char **argv)
 
     Node *root = parse(tokens);
 
-    parse_free(root);
     token_free(tokens);
+    SemaResult *result = NULL;
+    if (root && !error_count())
+        sema_analyze(root, &result);
+    sema_free(result);
+    parse_free(root);
     source_free(current_source());
 
     return error_count() > 0 ? 1 : 0;

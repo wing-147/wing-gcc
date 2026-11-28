@@ -12,6 +12,18 @@ typedef struct {
     PARSER_ALTERNATIVE_FIELDS(ParserStartsFn, ForInitParseFn);
 } ForInitAlternative;
 
+typedef struct {
+    PARSER_ALTERNATIVE_FIELDS(ParserStartsFn, NodeAlternativeParseFn);
+    bool is_block;
+} StatementAlternative;
+
+typedef enum {
+    STATEMENT_ORDINARY,
+    STATEMENT_CONTROLLED,
+} StatementScope;
+
+static Node *parse_statement(ParserCursor *cursor, StatementScope scope);
+
 // ---------------------------------------------------------------------------
 // Static statement productions (C11 Annex A.2.3)
 // ---------------------------------------------------------------------------
@@ -92,7 +104,7 @@ static bool parse_block_declaration(ParserCursor *cursor, Node **out)
 // through the block-item alternative protocol.
 static bool parse_block_statement(ParserCursor *cursor, Node **out)
 {
-    *out = parse_statement(cursor);
+    *out = parse_statement(cursor, STATEMENT_ORDINARY);
     return *out != NULL;
 }
 
@@ -170,14 +182,14 @@ static Node *parse_selection_if(ParserCursor *cursor)
         node_free(cond);
         return NULL;
     }
-    Node *then_stmt = parse_statement(cursor);
+    Node *then_stmt = parse_statement(cursor, STATEMENT_CONTROLLED);
     if (!then_stmt) {
         node_free(cond);
         return NULL;
     }
     Node *else_stmt = NULL;
     if (consume_if(cursor, TOK_KW_ELSE)) {
-        else_stmt = parse_statement(cursor);
+        else_stmt = parse_statement(cursor, STATEMENT_CONTROLLED);
         if (!else_stmt) {
             node_free(cond);
             node_free(then_stmt);
@@ -212,7 +224,7 @@ static Node *parse_selection_switch(ParserCursor *cursor)
         node_free(cond);
         return NULL;
     }
-    Node *body = parse_statement(cursor);
+    Node *body = parse_statement(cursor, STATEMENT_CONTROLLED);
     if (!body) {
         node_free(cond);
         return NULL;
@@ -270,7 +282,7 @@ static bool starts_iteration_do(const ParserCursor *cursor)
 static Node *parse_iteration_do(ParserCursor *cursor)
 {
     const Token *keyword = consume(cursor);
-    Node *body = parse_statement(cursor);
+    Node *body = parse_statement(cursor, STATEMENT_CONTROLLED);
     if (!body)
         return NULL;
     if (!expect(cursor, TOK_KW_WHILE)) {
@@ -324,7 +336,7 @@ static Node *parse_iteration_while(ParserCursor *cursor)
         node_free(cond);
         return NULL;
     }
-    Node *body = parse_statement(cursor);
+    Node *body = parse_statement(cursor, STATEMENT_CONTROLLED);
     if (!body) {
         node_free(cond);
         return NULL;
@@ -399,13 +411,12 @@ static const ForInitAlternative g_for_init_alternatives[] = {
 //     for ( expressionopt ; expressionopt ; expressionopt ) statement
 //     for ( declaration expressionopt ; expressionopt ) statement
 // Owned only by parse_iteration_statement(); this branch owns the common loop
-// clauses and balances their declaration scope.
+// clauses. The statement dispatcher owns their declaration scope.
 static Node *parse_iteration_for(ParserCursor *cursor)
 {
     const Token *keyword = consume(cursor);
     if (!expect(cursor, TOK_LPAREN))
         return NULL;
-    parser_push_scope(cursor);
     Node *init = NULL;
     const ForInitAlternative *init_alternative = NULL;
     for (size_t i = 0; i < ARRAY_LEN(g_for_init_alternatives); i++) {
@@ -416,11 +427,9 @@ static Node *parse_iteration_for(ParserCursor *cursor)
     }
     if (!init_alternative) {
         handle_parser_error_expected_expression(current_token(cursor));
-        parser_pop_scope(cursor);
         return NULL;
     }
     if (!init_alternative->parse(cursor, keyword, &init)) {
-        parser_pop_scope(cursor);
         return NULL;
     }
 
@@ -429,14 +438,12 @@ static Node *parse_iteration_for(ParserCursor *cursor)
         cond = parse_expression(cursor);
         if (!cond) {
             node_free(init);
-            parser_pop_scope(cursor);
             return NULL;
         }
     }
     if (!expect(cursor, TOK_SEMICOLON)) {
         node_free(init);
         node_free(cond);
-        parser_pop_scope(cursor);
         return NULL;
     }
 
@@ -446,7 +453,6 @@ static Node *parse_iteration_for(ParserCursor *cursor)
         if (!post) {
             node_free(init);
             node_free(cond);
-            parser_pop_scope(cursor);
             return NULL;
         }
     }
@@ -454,21 +460,17 @@ static Node *parse_iteration_for(ParserCursor *cursor)
         node_free(init);
         node_free(cond);
         node_free(post);
-        parser_pop_scope(cursor);
         return NULL;
     }
 
-    Node *body = parse_statement(cursor);
+    Node *body = parse_statement(cursor, STATEMENT_CONTROLLED);
     if (!body) {
         node_free(init);
         node_free(cond);
         node_free(post);
-        parser_pop_scope(cursor);
         return NULL;
     }
-    Node *loop = new_for(init, cond, post, body, keyword);
-    parser_pop_scope(cursor);
-    return loop;
+    return new_for(init, cond, post, body, keyword);
 }
 
 static const NodeAlternative g_iteration_alternatives[] = {
@@ -664,7 +666,7 @@ static Node *parse_labeled_identifier(ParserCursor *cursor)
 {
     const Token *name = consume(cursor);
     consume(cursor);
-    Node *stmt = parse_statement(cursor);
+    Node *stmt = parse_statement(cursor, STATEMENT_ORDINARY);
     if (!stmt)
         return NULL;
     return new_label(name, stmt);
@@ -693,7 +695,7 @@ static Node *parse_labeled_case(ParserCursor *cursor)
         node_free(expr);
         return NULL;
     }
-    Node *stmt = parse_statement(cursor);
+    Node *stmt = parse_statement(cursor, STATEMENT_ORDINARY);
     if (!stmt) {
         node_free(expr);
         return NULL;
@@ -719,7 +721,7 @@ static Node *parse_labeled_default(ParserCursor *cursor)
     const Token *keyword = consume(cursor);
     if (!expect(cursor, TOK_COLON))
         return NULL;
-    Node *stmt = parse_statement(cursor);
+    Node *stmt = parse_statement(cursor, STATEMENT_ORDINARY);
     if (!stmt)
         return NULL;
     return new_default(stmt, keyword);
@@ -758,13 +760,13 @@ static Node *parse_labeled_statement(ParserCursor *cursor)
 // statement dispatch private region
 // ---------------------------------------------------------------------------
 
-static const NodeAlternative g_statement_alternatives[] = {
-    { starts_labeled_statement, parse_labeled_statement },
-    { starts_compound_statement, parse_compound_statement },
-    { starts_expression_statement, parse_expression_statement },
-    { starts_selection_statement, parse_selection_statement },
-    { starts_iteration_statement, parse_iteration_statement },
-    { starts_jump_statement, parse_jump_statement },
+static const StatementAlternative g_statement_alternatives[] = {
+    { starts_labeled_statement, parse_labeled_statement, false },
+    { starts_compound_statement, parse_compound_statement, true },
+    { starts_expression_statement, parse_expression_statement, false },
+    { starts_selection_statement, parse_selection_statement, true },
+    { starts_iteration_statement, parse_iteration_statement, true },
+    { starts_jump_statement, parse_jump_statement, false },
 };
 
 // Select statement through the same inventory used by its parser.
@@ -784,14 +786,19 @@ static bool starts_statement(const ParserCursor *cursor)
 //     selection-statement
 //     iteration-statement
 //     jump-statement
-// statement (C11 6.8): select only its six grammar children. A stray else is
-// handled after every legal alternative declines; it is recovery, not a
-// seventh statement production.
-Node *parse_statement(ParserCursor *cursor)
+// A controlled statement that is already a block uses one scope for both roles.
+static Node *parse_statement(ParserCursor *cursor, StatementScope scope)
 {
     for (size_t i = 0; i < ARRAY_LEN(g_statement_alternatives); i++) {
-        if (g_statement_alternatives[i].starts(cursor))
-            return g_statement_alternatives[i].parse(cursor);
+        const StatementAlternative *alternative = &g_statement_alternatives[i];
+        if (!alternative->starts(cursor))
+            continue;
+        if (scope == STATEMENT_ORDINARY && !alternative->is_block)
+            return alternative->parse(cursor);
+        parser_push_scope(cursor, NULL);
+        Node *statement = alternative->parse(cursor);
+        parser_pop_scope(cursor, NULL);
+        return statement;
     }
     if (token_is(current_token(cursor), TOK_KW_ELSE)) {
         handle_parser_error_else_without_if(cursor);
@@ -803,13 +810,12 @@ Node *parse_statement(ParserCursor *cursor)
 
 // (6.8.2) compound-statement:
 //     { block-item-listopt }
+// The caller owns the block scope, which may already contain parameters.
 Node *parse_compound_statement(ParserCursor *cursor)
 {
     Token *open = expect(cursor, TOK_LBRACE);
     if (!open)
         return NULL;
-    parser_push_scope(cursor);
-
     const Token *last_start = NULL;
     skip_directives(cursor);
     Node *head = NULL;
@@ -829,16 +835,13 @@ Node *parse_compound_statement(ParserCursor *cursor)
     if (at_eof(current_token(cursor))) {
         handle_parser_error_unclosed_block(open, last_start);
         node_free(head);
-        parser_pop_scope(cursor);
         return NULL;
     }
     Token *close = expect(cursor, TOK_RBRACE);
     if (!close) {
         node_free(head);
-        parser_pop_scope(cursor);
         return NULL;
     }
-    parser_pop_scope(cursor);
     return new_block(head, open, close);
 }
 

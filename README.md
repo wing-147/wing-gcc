@@ -7,12 +7,11 @@ how compilers work and to strengthen a binary-security skill set.
 
 ## Overview
 
-`wing-gcc` is a self-contained C compiler that translates a practical subset of
-C into machine code. The front end is built stage by stage — source handling,
-lexical analysis, parsing, and AST construction — and later stages will lower
-the AST toward a backend. The goal is to make every layer explicit and
-understandable: no parser generator, no external compiler framework, just C and
-the operating system.
+`wing-gcc` currently analyzes a practical subset of C11. Its front end handles
+source loading, lexical analysis, parsing, AST construction, and semantic
+analysis. The planned backend will lower the AST and semantic results to
+x86-64 machine code. Each layer is implemented directly in C without a parser
+generator or external compiler framework.
 
 ## Goals
 
@@ -31,11 +30,12 @@ the operating system.
 | ----------------- | ------------------------------------------------------------ |
 | Source management | ✅ `source.c` / `source.h`                                    |
 | Lexer             | ✅ Numbers, strings, chars, identifiers, keywords, punctuation, comments |
-| AST               | 🚧 Node types and interfaces defined                          |
-| Parser            | 🚧 Expressions, statements, functions, recursive declarations |
+| AST               | ✅ Syntax tree and ownership for the supported subset         |
+| Parser            | ✅ Recursive-descent parser for the supported subset          |
+| Semantic analysis | ✅ Types, bindings, conversions, initializers, control flow  |
 | Code generation   | ⬜ Planned                                                    |
 
-The lexer is complete: it turns a source buffer into a linked list of tokens,
+The lexer turns a source buffer into a linked list of tokens,
 handling numeric, string, and character literals (including `u8`/`u`/`U`/`L`
 prefixes), identifiers and keywords, punctuators, and line/block comments.
 Scanning, location attachment, literal decoding, and phase-6 adjacent-string
@@ -48,12 +48,21 @@ compound literals, and generic selections. Recovery operates at statement and ex
 boundaries. Implicit return types (C89) and nested function definitions are
 intentionally unsupported.
 
+Semantic analysis checks types, declarations, linkage, calls, control flow,
+and initializers for scalars, arrays with fixed or inferred bounds, structures,
+and unions. It also handles enums, compound literals, `_Static_assert`,
+`_Atomic`, `_Alignas`, `_Alignof`, `_Generic`, `_Thread_local`, `inline`, and `_Noreturn`.
+The semantic analyzer reports errors for variable-length arrays, variably
+modified types, and K&R-style function definitions with nonempty identifier lists.
+Preprocessing is pending, so `#include` directives do not supply header
+declarations to the front end.
+
 ## Architecture
 
 ```
         +-----------+     +---------+     +----------+     +-----+
-source  |  source.c | --> |  lexer/ | --> | parser/  | --> | AST | --> backend
-buffer  |           |     | tokenize|     |  parse   |     |     |     (planned)
+source  |  source.c | --> |  lexer/ | --> | parser/  | --> | AST | --> sema/ --> backend
+buffer  |           |     | tokenize|     |  parse   |     |     |              (planned)
         +-----------+     +---------+     +----------+     +-----+
                               |                |
                               v                v
@@ -70,6 +79,18 @@ internal errors. A small open-addressing `HashMap` (`hashmap.c`) supports
 front-end name state, and display-width rules live alongside source locations in
 `source.h` so token columns and diagnostic carets always agree.
 
+### Semantic analysis
+
+After successful lexing and parsing, the default driver calls `sema_analyze()`
+with the AST root and takes ownership of the result on success. Read-only
+queries use AST nodes as keys for declaration snapshots, expression types and
+value categories, ordered implicit conversions, initializer steps, and
+control-flow targets. [Public semantic interface](include/frontend/sema.h)
+
+The result borrows the AST and source, so callers release the result first with
+`sema_free()`, then release the AST and source. The planned backend will consume
+the AST and semantic records to build IR and control flow.
+
 ## Directory layout
 
 ```
@@ -84,6 +105,7 @@ wing-gcc/
 │   │   ├── ast.h         # AST node definitions
 │   │   ├── lexer.h       # Lexer interface
 │   │   ├── parser.h      # Parser interface
+│   │   ├── sema.h        # Semantic analysis and result queries
 │   │   └── token.h       # Token definitions
 │   └── backend/          # Reserved: created with the first backend file
 ├── src/                  # Compiler implementation, mirroring include/
@@ -100,14 +122,27 @@ wing-gcc/
 │   │   │   ├── literal.c # Literal validation and decoding
 │   │   │   ├── scan.c    # Token-boundary scanning
 │   │   │   └── token.c   # Exact terminal inventory and token lifetime
-│   │   └── parser/       # Recursive-descent parser subsystem
-│   │       ├── ast.c
+│   │   ├── parser/       # Recursive-descent parser subsystem
+│   │   │   ├── ast.c
+│   │   │   ├── declaration.c
+│   │   │   ├── diagnostic.c
+│   │   │   ├── expression.c
+│   │   │   ├── parser.c
+│   │   │   ├── parser_internal.h
+│   │   │   └── statement.c
+│   │   └── sema/         # Semantic analysis and result storage
+│   │       ├── constant.c
+│   │       ├── conversion.c
 │   │       ├── declaration.c
-│   │       ├── diagnostic.c
 │   │       ├── expression.c
-│   │       ├── parser.c
-│   │       ├── parser_internal.h
-│   │       └── statement.c
+│   │       ├── initializer.c
+│   │       ├── layout.c
+│   │       ├── result.c
+│   │       ├── scope.c
+│   │       ├── sema.c
+│   │       ├── sema_internal.h
+│   │       ├── statement.c
+│   │       └── type.c
 │   └── backend/          # Reserved: created with the first backend file
 ├── tests/            # Test programs
 │   ├── tests/        # Internal cases: valid/ accepted, error_lex/ rejected,
@@ -133,38 +168,40 @@ make check          # Build and run every test driver
 make clean          # Remove bin/
 ```
 
-Individual test drivers: `make lexer_test diagnostic_test source_test hashmap_test parser_test`.
+Individual test drivers: `make lexer_test diagnostic_test source_test hashmap_test parser_test sema_test`.
 
 ### Testing
 
 `make check` builds `wing-gcc` and runs the assertion-based unit tests
 (`source_test`, `diagnostic_test`, `hashmap_test`), the lexer tests (token
-classification, display line/column, full token-stream comparison) and the
-parser tests (cursor/scope primitives, AST constructors, declarations,
-expression levels, and statement/external-declaration recovery).
+classification, display line/column, full token-stream comparison), parser
+tests (cursor/scope primitives, AST constructors, declarations, expression
+levels, and recovery), and semantic tests (bindings, conversions, jump targets,
+initializer placement, and diagnostics).
 
-`./test.py` runs wing-gcc and real `gcc` on the same sources and compares every
-complete diagnostic block — the `file:line:col: error: message` line, the quoted
-source line and the caret line. Each wing-gcc diagnostic must have a counterpart
-on both sides: `match` (byte-identical, one-to-one), `near` (same location or
-same message after normalization, and every gcc block still matched), `differ`
+`./test.py` runs wing-gcc and `gcc -std=c11 -pedantic-errors` on the same
+sources. It compares complete diagnostic blocks, including location, message,
+quoted source, and caret lines. Results are classified as `match`
+(byte-identical, one-to-one), `near` (same location or normalized message, with
+every GCC block matched), `differ`
 (some block has no counterpart, or only partially agrees), `missed` (gcc
 rejects, wing-gcc accepts), `FALSE+` (gcc accepts, wing-gcc rejects). All files
 run through the full front end; there is no lex-only mode. `false-positives`
-must stay 0 for chapters 1–4; chapter 5+ and lexical `valid/` failures surface
-as parser-coverage debt. There is no exemption list: a file gcc accepts that
-wing-gcc rejects is a `FALSE+` and fails the run.
+must stay 0 for chapters 1–4. Chapter 5 requires both `missed` and
+`false-positives` to be 0. Every file gcc accepts and wing-gcc rejects
+counts as a `FALSE+` and fails the run, including cases where an unexpanded
+`#include` leaves a name undeclared.
 `-my` runs `tests/tests`,
 `-third-party <chapter> [dir]` runs the vendored suite, and `-v` prints the
 complete output of both compilers.
 
 ## Usage
 
-The driver runs the front end: it lexes and parses the file, reports diagnostics
-(silent on success), and returns a non-zero status on any error.
+The driver lexes and parses the file, runs semantic analysis, and returns a
+non-zero status when it reports an error.
 
 ```sh
-./bin/wing-gcc tests/tests/basic.c     # lex + parse; silent on success
+./bin/wing-gcc tests/tests/basic.c     # analyze the source through the front end
 ./bin/lexer_test tests/tests/basic.c   # dedicated token-dump driver
 ```
 
@@ -187,8 +224,9 @@ EOF
 
 - [x] Source management
 - [x] Lexer
-- [ ] Parser and AST construction
-- [ ] Semantic analysis
+- [x] Parser and AST construction for the supported subset
+- [x] Semantic analysis for the supported subset
+- [ ] Preprocessing and deferred C11 features
 - [ ] IR and optimizations
 - [ ] x86-64 code generation
 - [ ] Self-hosting exploration
